@@ -232,7 +232,7 @@ interface DelegationRecord {
 	result?: string
 }
 
-const DEFAULT_MAX_RUN_TIME_MS = 15 * 60 * 1000 // 15 minutes
+const DEFAULT_MAX_RUN_TIME_MS = 90 * 60 * 1000 // 90 minutes
 const TERMINAL_WAIT_GRACE_MS = 10_000
 const READ_POLL_INTERVAL_MS = 250
 const ALL_COMPLETE_QUIET_PERIOD_MS = 50
