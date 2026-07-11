@@ -13,10 +13,28 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
-import type { Event, Message, Part, TextPart } from "@opencode-ai/sdk"
+import type { Event, Message, Part, ReasoningPart, TextPart } from "@opencode-ai/sdk"
 import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 import type { OpencodeClient } from "./kdco-primitives/types"
+import {
+	type DelegationOutcome,
+	registerDelegationHandle,
+	type WorkflowDelegateOptions,
+} from "./lib/delegation-registry"
+import {
+	HARNESS_DEFAULTS,
+	type HarnessConfig,
+	loadHarnessConfig,
+} from "./lib/harness-config"
+import {
+	AcquireAbortedError,
+	getScheduler,
+	type Lease,
+	QueueWaitTimeoutError,
+	type TierScheduler,
+} from "./lib/scheduler"
+import { createTierResolver, splitModelRef, type TierResolver } from "./lib/tiers"
 
 // ==========================================
 // READABLE ID GENERATION
@@ -38,6 +56,19 @@ function generateReadableId(): string {
 interface GeneratedMetadata {
 	title: string
 	description: string
+}
+
+/**
+ * Free title/description from truncation. The default path: no extra LLM call
+ * per delegation (harness.jsonc metadata.useLlm re-enables the model version).
+ */
+function truncationMetadata(resultContent: string): GeneratedMetadata {
+	const firstLine =
+		resultContent.split("\n").find((l) => l.trim().length > 0) || "Delegation result"
+	const title = firstLine.slice(0, 30).trim() + (firstLine.length > 30 ? "..." : "")
+	const description =
+		resultContent.slice(0, 150).trim() + (resultContent.length > 150 ? "..." : "")
+	return { title, description }
 }
 
 /**
@@ -160,7 +191,14 @@ interface AssistantSessionMessageItem {
 	parts: Part[]
 }
 
-type DelegationStatus = "registered" | "running" | "complete" | "error" | "cancelled" | "timeout"
+type DelegationStatus =
+	| "registered"
+	| "queued"
+	| "running"
+	| "complete"
+	| "error"
+	| "cancelled"
+	| "timeout"
 
 type DelegationTerminalStatus = Extract<
 	DelegationStatus,
@@ -214,14 +252,24 @@ interface DelegationRecord {
 	parentAgent: string
 	prompt: string
 	agent: string
+	tier: string | null
+	modelOverride?: string
+	silent: boolean
+	queuePosition?: number
+	/** Terminal status an abort-initiating caller intends; beats idle's "complete". */
+	pendingTerminalStatus?: DelegationTerminalStatus
 	notificationCycle: number
 	notificationCycleToken: string
 	status: DelegationStatus
 	createdAt: Date
 	startedAt?: Date
+	dispatchedAt?: Date
 	completedAt?: Date
 	updatedAt: Date
-	timeoutAt: Date
+	timeoutAt?: Date
+	lastActivityAt: Date
+	/** callID -> started-at ms for tool calls in flight inside this session. */
+	activeToolCallIDs: Map<string, number>
 	progress: DelegationProgress
 	notification: DelegationNotificationState
 	retrieval: DelegationRetrievalState
@@ -232,11 +280,16 @@ interface DelegationRecord {
 	result?: string
 }
 
-const DEFAULT_MAX_RUN_TIME_MS = 15 * 60 * 1000 // 15 minutes
-const TERMINAL_WAIT_GRACE_MS = 10_000
+// Wall-clock budget default comes from harness.jsonc (0 = unlimited). The
+// inactivity watchdog is the real safety net for hung generations.
 const READ_POLL_INTERVAL_MS = 250
 const ALL_COMPLETE_QUIET_PERIOD_MS = 50
 const PARENT_NOTIFICATION_TIMEOUT_MS = 5_000
+const INACTIVITY_SWEEP_INTERVAL_MS = 30_000
+const AWAIT_RESULT_SETTLE_MS = 10_000
+// Fallback when harness config is absent: how long a task lease may be held
+// before the sweep presumes its tool call died without an after-hook.
+const TASK_LEASE_STALE_FALLBACK_MS = 45 * 60 * 1000
 
 interface DelegateInput {
 	parentSessionID: string
@@ -244,6 +297,7 @@ interface DelegateInput {
 	parentAgent: string
 	prompt: string
 	agent: string
+	options?: WorkflowDelegateOptions
 }
 
 interface DelegationListItem {
@@ -258,10 +312,12 @@ interface DelegationListItem {
 interface DelegationManagerOptions {
 	maxRunTimeMs?: number
 	readPollIntervalMs?: number
-	terminalWaitGraceMs?: number
 	allCompleteQuietPeriodMs?: number
 	idGenerator?: () => string
 	metadataGenerator?: typeof generateMetadata
+	harness?: HarnessConfig
+	scheduler?: TierScheduler
+	resolver?: TierResolver
 }
 
 // ==========================================
@@ -379,16 +435,18 @@ function isTerminalStatus(status: DelegationStatus): status is DelegationTermina
 }
 
 function isActiveStatus(status: DelegationStatus): boolean {
-	return status === "registered" || status === "running"
+	return status === "registered" || status === "queued" || status === "running"
 }
 
 function normalizeId(value: string): string {
-	return value.trim()
+	// Plan citations use "ref:<id>"; accept both forms everywhere IDs are read.
+	return value.trim().replace(/^ref:/, "")
 }
 
 function parsePersistedStatus(raw: string | undefined): DelegationStatus {
 	if (!raw) return "complete"
 	if (raw === "registered") return "registered"
+	if (raw === "queued") return "queued"
 	if (raw === "running") return "running"
 	if (raw === "complete") return "complete"
 	if (raw === "error") return "error"
@@ -407,13 +465,18 @@ class DelegationManager {
 	private log: Logger
 	private maxRunTimeMs: number
 	private readPollIntervalMs: number
-	private terminalWaitGraceMs: number
 	private allCompleteQuietPeriodMs: number
 	private idGenerator: () => string
 	private metadataGenerator: typeof generateMetadata
 	private pendingByParent: Map<string, Set<string>> = new Map()
 	private parentNotificationState: Map<string, ParentNotificationState> = new Map()
 	private pendingNotifications: Map<string, string[]> = new Map()
+	private harness: HarnessConfig
+	private scheduler?: TierScheduler
+	private resolver?: TierResolver
+	private leases: Map<string, Lease> = new Map()
+	private queueAborts: Map<string, AbortController> = new Map()
+	private inactivityTimer?: ReturnType<typeof setInterval>
 
 	constructor(
 		client: OpencodeClient,
@@ -424,9 +487,11 @@ class DelegationManager {
 		this.client = client
 		this.baseDir = baseDir
 		this.log = log
-		this.maxRunTimeMs = options.maxRunTimeMs ?? DEFAULT_MAX_RUN_TIME_MS
+		this.harness = options.harness ?? HARNESS_DEFAULTS
+		this.scheduler = options.scheduler
+		this.resolver = options.resolver
+		this.maxRunTimeMs = options.maxRunTimeMs ?? this.harness.timeouts.dispatchBudgetMs
 		this.readPollIntervalMs = options.readPollIntervalMs ?? READ_POLL_INTERVAL_MS
-		this.terminalWaitGraceMs = options.terminalWaitGraceMs ?? TERMINAL_WAIT_GRACE_MS
 		this.allCompleteQuietPeriodMs = options.allCompleteQuietPeriodMs ?? ALL_COMPLETE_QUIET_PERIOD_MS
 		this.idGenerator = options.idGenerator ?? generateReadableId
 		this.metadataGenerator = options.metadataGenerator ?? generateMetadata
@@ -504,6 +569,8 @@ class DelegationManager {
 
 	private scheduleTimeout(id: string): void {
 		this.clearTimeoutTimer(id)
+		// 0 means unlimited wall clock; the inactivity watchdog covers hangs.
+		if (this.maxRunTimeMs <= 0) return
 		const timer = setTimeout(() => {
 			void this.handleTimeout(id)
 		}, this.maxRunTimeMs + 5_000)
@@ -533,8 +600,11 @@ class DelegationManager {
 		prompt: string
 		agent: string
 		artifactPath: string
+		tier: string | null
+		modelOverride?: string
+		silent: boolean
 	}): DelegationRecord {
-		if (!this.pendingByParent.has(input.parentSessionID)) {
+		if (!input.silent && !this.pendingByParent.has(input.parentSessionID)) {
 			this.pendingByParent.set(input.parentSessionID, new Set())
 			this.resetParentAllCompleteNotificationCycle(input.parentSessionID)
 		}
@@ -553,12 +623,16 @@ class DelegationManager {
 			parentAgent: input.parentAgent,
 			prompt: input.prompt,
 			agent: input.agent,
+			tier: input.tier,
+			modelOverride: input.modelOverride,
+			silent: input.silent,
 			notificationCycle,
 			notificationCycleToken,
 			status: "registered",
 			createdAt: now,
 			updatedAt: now,
-			timeoutAt: new Date(now.getTime() + this.maxRunTimeMs),
+			lastActivityAt: now,
+			activeToolCallIDs: new Map(),
 			progress: {
 				toolCalls: 0,
 				lastUpdateAt: now,
@@ -578,7 +652,9 @@ class DelegationManager {
 		this.delegations.set(delegation.id, delegation)
 		this.delegationsBySession.set(delegation.sessionID, delegation.id)
 		this.createTerminalWaiter(delegation.id)
-		this.pendingByParent.get(delegation.parentSessionID)?.add(delegation.id)
+		if (!input.silent) {
+			this.pendingByParent.get(delegation.parentSessionID)?.add(delegation.id)
+		}
 
 		return delegation
 	}
@@ -588,6 +664,7 @@ class DelegationManager {
 			if (isTerminalStatus(delegation.status)) return
 			delegation.status = "running"
 			delegation.startedAt = now
+			delegation.lastActivityAt = now
 			delegation.progress.lastUpdateAt = now
 			delegation.progress.lastHeartbeatAt = now
 		})
@@ -596,11 +673,12 @@ class DelegationManager {
 	private markProgress(id: string, messageText?: string): DelegationRecord | undefined {
 		return this.updateDelegation(id, (delegation, now) => {
 			if (isTerminalStatus(delegation.status)) return
-			if (delegation.status === "registered") {
+			if (delegation.status === "registered" || delegation.status === "queued") {
 				delegation.status = "running"
 				delegation.startedAt = delegation.startedAt ?? now
 			}
 
+			delegation.lastActivityAt = now
 			delegation.progress.lastUpdateAt = now
 			delegation.progress.lastHeartbeatAt = now
 
@@ -638,6 +716,21 @@ class DelegationManager {
 				this.pendingByParent.delete(delegation.parentSessionID)
 			}
 		}
+
+		// Single release point for scheduler resources: every terminal path
+		// (complete, error, timeout, cancel) funnels through this once-only
+		// transition, so slots can never leak or double-free.
+		const lease = this.leases.get(id)
+		if (lease) {
+			this.leases.delete(id)
+			void lease.release()
+		}
+		const queueAbort = this.queueAborts.get(id)
+		if (queueAbort) {
+			this.queueAborts.delete(id)
+			queueAbort.abort()
+		}
+		delegation.activeToolCallIDs.clear()
 
 		this.clearTimeoutTimer(id)
 		this.resolveTerminalWaiter(id)
@@ -700,6 +793,9 @@ class DelegationManager {
 		for (const delegation of this.delegations.values()) {
 			if (delegation.parentSessionID !== parentSessionID) continue
 			if (delegation.notificationCycleToken !== cycleToken) continue
+			// Silent (workflow) delegations never emit terminal notifications, so
+			// counting them here would block the all-complete signal forever.
+			if (delegation.silent) continue
 
 			cycleDelegationCount += 1
 			if (!delegation.notification.terminalNotifiedAt) {
@@ -992,7 +1088,8 @@ class DelegationManager {
 		}
 
 		if (delegation.status === "cancelled") {
-			return "Delegation was cancelled before completion."
+			const partial = await this.getResult(delegation)
+			return `${partial}\n\n[CANCELLED]`
 		}
 
 		if (delegation.status === "timeout") {
@@ -1017,18 +1114,21 @@ class DelegationManager {
 		delegation.result = resolvedResult
 
 		if (resolvedResult.trim().length > 0) {
-			const metadata = await this.metadataGenerator(
-				this.client,
-				resolvedResult,
-				delegation.sessionID,
-				(msg) => this.debugLog(msg),
-			)
+			// Truncation is the default: no extra LLM round-trip per delegation.
+			const metadata =
+				!delegation.silent && this.harness.metadata.useLlm
+					? await this.metadataGenerator(this.client, resolvedResult, delegation.sessionID, (msg) =>
+							this.debugLog(msg),
+						)
+					: truncationMetadata(resolvedResult)
 			delegation.title = metadata.title
 			delegation.description = metadata.description
 		}
 
 		await this.persistOutput(delegation, resolvedResult)
-		await this.notifyParent(delegation.id)
+		if (!delegation.silent) {
+			await this.notifyParent(delegation.id)
+		}
 	}
 
 	private async notifyParent(delegationId: string): Promise<void> {
@@ -1088,15 +1188,32 @@ class DelegationManager {
 			)
 		}
 
-		// Check if agent is read-only (Early Exit + Fail Fast)
-		const { isReadOnly } = await parseAgentWriteCapability(this.client, input.agent, this.log)
-		if (!isReadOnly) {
+		// Check if agent is read-only (Early Exit + Fail Fast).
+		// Workflow-originated delegations may bypass this: the workflow runtime is
+		// responsible for the parallelism, and its agents still queue for slots.
+		if (!input.options?.skipReadOnlyGuard) {
+			const { isReadOnly } = await parseAgentWriteCapability(this.client, input.agent, this.log)
+			if (!isReadOnly) {
+				throw new Error(
+					`Agent "${input.agent}" is write-capable and requires the native \`task\` tool for proper undo/branching support.\n\n` +
+						`Use \`task\` instead of \`delegate\` for write-capable agents.\n\n` +
+						`Read-only sub-agents (edit/write/bash denied) use \`delegate\`.\n` +
+						`Write-capable sub-agents (any write permission) use \`task\`.`,
+				)
+			}
+		}
+
+		// Resolve the scheduler tier (and validate any model override) up front so
+		// bad input fails before a session is created.
+		let tier: string | null = null
+		if (input.options?.model && !splitModelRef(input.options.model)) {
 			throw new Error(
-				`Agent "${input.agent}" is write-capable and requires the native \`task\` tool for proper undo/branching support.\n\n` +
-					`Use \`task\` instead of \`delegate\` for write-capable agents.\n\n` +
-					`Read-only sub-agents (edit/write/bash denied) use \`delegate\`.\n` +
-					`Write-capable sub-agents (any write permission) use \`task\`.`,
+				`Invalid model override "${input.options.model}". Use "provider/model" form, e.g. "lmstudio/qwen/qwen3.6-27b".`,
 			)
+		}
+		if (this.resolver) {
+			const resolved = await this.resolver.resolveAgentTier(input.agent, input.options?.model)
+			tier = resolved.tier
 		}
 
 		const artifactDir = await this.ensureDelegationsDir(input.parentSessionID)
@@ -1130,11 +1247,88 @@ class DelegationManager {
 			prompt: input.prompt,
 			agent: input.agent,
 			artifactPath,
+			tier,
+			modelOverride: input.options?.model,
+			silent: input.options?.silent ?? false,
 		})
 
-		await this.debugLog(`Registered delegation ${delegation.id} before execution`)
-		this.scheduleTimeout(delegation.id)
-		this.markStarted(delegation.id)
+		await this.debugLog(
+			`Registered delegation ${delegation.id} (tier=${tier ?? "uncapped"}, silent=${delegation.silent})`,
+		)
+
+		if (!tier || !this.scheduler) {
+			void this.dispatch(delegation.id, undefined)
+			return delegation
+		}
+
+		// Queue for a tier slot; dispatch fires when one frees. The delegation is
+		// visible (and cancellable) the whole time it waits.
+		const controller = new AbortController()
+		this.queueAborts.set(delegation.id, controller)
+		this.scheduler
+			.acquire(tier, {
+				kind: delegation.silent ? "workflow" : "delegate",
+				agent: input.agent,
+				sessionID: delegation.sessionID,
+				jobId: delegation.id,
+				signal: controller.signal,
+				maxWaitMs: this.harness.timeouts.queueWaitMs,
+				onQueued: (position) => {
+					this.updateDelegation(delegation.id, (record) => {
+						if (record.status !== "registered") return
+						record.status = "queued"
+						record.queuePosition = position
+					})
+				},
+			})
+			.then((lease) => {
+				this.queueAborts.delete(delegation.id)
+				void this.dispatch(delegation.id, lease)
+			})
+			.catch((error: unknown) => {
+				this.queueAborts.delete(delegation.id)
+				// Aborted acquires happen when the delegation was cancelled or
+				// finalized while queued; that path already settled the record.
+				if (error instanceof AcquireAbortedError) return
+				void this.finalizeDelegation(
+					delegation.id,
+					"error",
+					error instanceof QueueWaitTimeoutError
+						? `${error.message}. Check agents_status() for tier occupancy.`
+						: error instanceof Error
+							? error.message
+							: String(error),
+				)
+			})
+
+		return delegation
+	}
+
+	/**
+	 * Start a delegation's agent loop. Called immediately for uncapped tiers or
+	 * once a scheduler slot has been acquired. The wall-clock budget (if any) is
+	 * armed HERE, not at enqueue, so queued time never counts against the run.
+	 */
+	private async dispatch(id: string, lease: Lease | undefined): Promise<void> {
+		const delegation = this.delegations.get(id)
+		if (!delegation || isTerminalStatus(delegation.status)) {
+			if (lease) await lease.release()
+			return
+		}
+		if (lease) this.leases.set(id, lease)
+
+		this.updateDelegation(id, (record, now) => {
+			record.dispatchedAt = now
+			record.lastActivityAt = now
+			record.queuePosition = undefined
+			if (this.maxRunTimeMs > 0) {
+				record.timeoutAt = new Date(now.getTime() + this.maxRunTimeMs)
+			}
+		})
+		this.scheduleTimeout(id)
+		this.markStarted(id)
+
+		const modelRef = delegation.modelOverride ? splitModelRef(delegation.modelOverride) : undefined
 
 		// Fire the prompt (using prompt() instead of promptAsync() to properly initialize agent loop)
 		// Agent param is critical for MCP tools - tells OpenCode which agent's config to use
@@ -1143,13 +1337,17 @@ class DelegationManager {
 			.prompt({
 				path: { id: delegation.sessionID },
 				body: {
-					agent: input.agent,
-					parts: [{ type: "text", text: input.prompt }],
+					agent: delegation.agent,
+					...(modelRef ? { model: modelRef } : {}),
+					parts: [{ type: "text", text: delegation.prompt }],
 					tools: {
 						task: false,
 						delegate: false,
+						delegation_cancel: false,
 						todowrite: false,
 						plan_save: false,
+						workflow: false,
+						workflow_status: false,
 					},
 				},
 			})
@@ -1159,12 +1357,11 @@ class DelegationManager {
 			.catch((error: Error) => {
 				void this.finalizeDelegation(delegation.id, "error", error.message)
 			})
-
-		return delegation
 	}
 
 	/**
-	 * Handle delegation timeout
+	 * Handle delegation wall-clock timeout (only armed when dispatchBudgetMs > 0).
+	 * Aborts the session instead of deleting it so partial output survives.
 	 */
 	private async handleTimeout(delegationId: string): Promise<void> {
 		const delegation = this.delegations.get(delegationId)
@@ -1172,9 +1369,9 @@ class DelegationManager {
 
 		await this.debugLog(`handleTimeout for delegation ${delegation.id}`)
 
-		// Try to cancel the session
+		delegation.pendingTerminalStatus = "timeout"
 		try {
-			await this.client.session.delete({
+			await this.client.session.abort({
 				path: { id: delegation.sessionID },
 			})
 		} catch {
@@ -1184,16 +1381,117 @@ class DelegationManager {
 		await this.finalizeDelegation(
 			delegation.id,
 			"timeout",
-			`Delegation timed out after ${this.maxRunTimeMs / 1000}s`,
+			`Delegation exceeded its ${Math.round(this.maxRunTimeMs / 1000)}s wall-clock budget`,
 		)
 	}
 
 	/**
-	 * Handle session.idle event - called when a session becomes idle
+	 * Inactivity watchdog: the only default kill switch. A running delegation is
+	 * stalled when the model has streamed nothing AND no tool call is in flight
+	 * for timeouts.inactivityMs. A subagent running a 40-minute build never
+	 * trips this; a hung generation does, freeing its tier slot for the queue.
+	 */
+	startInactivityWatchdog(): void {
+		if (this.inactivityTimer) return
+		if (this.harness.timeouts.inactivityMs <= 0) return
+		this.inactivityTimer = setInterval(() => {
+			void this.sweepStalledDelegations()
+		}, INACTIVITY_SWEEP_INTERVAL_MS)
+		this.inactivityTimer.unref?.()
+	}
+
+	stopInactivityWatchdog(): void {
+		if (!this.inactivityTimer) return
+		clearInterval(this.inactivityTimer)
+		this.inactivityTimer = undefined
+	}
+
+	private async sweepStalledDelegations(): Promise<void> {
+		const inactivityMs = this.harness.timeouts.inactivityMs
+		if (inactivityMs <= 0) return
+		const now = Date.now()
+
+		for (const delegation of this.delegations.values()) {
+			if (delegation.status !== "running") continue
+
+			// opencode does not fire tool.execute.after for tools that error, and
+			// remote MCP calls can hang forever. Purge entries past the deference
+			// cap so one dead tool call cannot disarm the watchdog indefinitely.
+			const toolCallStaleMs = this.harness.timeouts.toolCallStaleMs
+			if (toolCallStaleMs > 0) {
+				for (const [callID, startedAtMs] of delegation.activeToolCallIDs) {
+					if (now - startedAtMs > toolCallStaleMs) {
+						delegation.activeToolCallIDs.delete(callID)
+						await this.debugLog(
+							`inactivity watchdog: presuming dead tool call ${callID} in ${delegation.id} (in flight ${Math.round((now - startedAtMs) / 60_000)}m)`,
+						)
+					}
+				}
+			}
+
+			if (delegation.activeToolCallIDs.size > 0) continue
+			if (now - delegation.lastActivityAt.getTime() <= inactivityMs) continue
+
+			await this.debugLog(`inactivity watchdog: aborting stalled delegation ${delegation.id}`)
+			delegation.pendingTerminalStatus = "timeout"
+			try {
+				await this.client.session.abort({ path: { id: delegation.sessionID } })
+			} catch {
+				// Ignore
+			}
+			await this.finalizeDelegation(
+				delegation.id,
+				"timeout",
+				`Stalled: no model output or tool activity for ${Math.round(inactivityMs / 60_000)} minutes`,
+			)
+		}
+	}
+
+	/** Record streamed-output activity for a delegation's session. */
+	recordActivity(sessionID: string): void {
+		const delegation = this.findBySession(sessionID)
+		if (!delegation || isTerminalStatus(delegation.status)) return
+		delegation.lastActivityAt = new Date()
+	}
+
+	/** Track tool calls in flight inside delegation sessions (watchdog input). */
+	noteToolStart(sessionID: string, callID: string): void {
+		const delegation = this.findBySession(sessionID)
+		if (!delegation || isTerminalStatus(delegation.status)) return
+		delegation.activeToolCallIDs.set(callID, Date.now())
+		delegation.lastActivityAt = new Date()
+	}
+
+	noteToolEnd(sessionID: string, callID: string): void {
+		const delegation = this.findBySession(sessionID)
+		if (!delegation) return
+		delegation.activeToolCallIDs.delete(callID)
+		delegation.lastActivityAt = new Date()
+	}
+
+	/**
+	 * Handle session.idle event - called when a session becomes idle.
+	 * Only a RUNNING delegation may finalize here: queued delegations own idle
+	 * (never-prompted) sessions, and finalizing those would report empty results.
 	 */
 	async handleSessionIdle(sessionID: string): Promise<void> {
 		const delegation = this.findBySession(sessionID)
 		if (!delegation || isTerminalStatus(delegation.status)) return
+		if (delegation.status !== "running") {
+			await this.debugLog(
+				`handleSessionIdle ignored for ${delegation.id} (status=${delegation.status})`,
+			)
+			return
+		}
+
+		// session.abort emits an idle event; when a cancel/timeout initiator is
+		// mid-finalize, do not race it into a bogus "complete".
+		if (delegation.pendingTerminalStatus) {
+			await this.debugLog(
+				`handleSessionIdle deferring to pending ${delegation.pendingTerminalStatus} for ${delegation.id}`,
+			)
+			return
+		}
 
 		await this.debugLog(`handleSessionIdle for delegation ${delegation.id}`)
 		await this.finalizeDelegation(delegation.id, "complete")
@@ -1212,7 +1510,7 @@ class DelegationManager {
 
 			if (!messageData || messageData.length === 0) {
 				await this.debugLog(`getResult: No messages found for session ${delegation.sessionID}`)
-				return `Delegation "${delegation.description}" completed but produced no output.`
+				return `Delegation "${delegation.id}" completed but produced no output.`
 			}
 
 			await this.debugLog(
@@ -1229,28 +1527,53 @@ class DelegationManager {
 				await this.debugLog(
 					`getResult: No assistant messages found in ${JSON.stringify(messageData.map((m) => ({ role: m.info.role, keys: Object.keys(m) })))}`,
 				)
-				return `Delegation "${delegation.description}" completed but produced no assistant response.`
+				return `Delegation "${delegation.id}" completed but produced no assistant response.`
+			}
+
+			const isTextPart = (p: Part): p is TextPart => p.type === "text"
+			const extractText = (message: AssistantSessionMessageItem): string | null => {
+				const textParts = message.parts.filter(isTextPart)
+				if (textParts.length === 0) return null
+				return textParts.map((p) => p.text).join("\n")
 			}
 
 			const lastMessage = assistantMessages[assistantMessages.length - 1]
+			const lastText = extractText(lastMessage)
+			if (lastText !== null) return lastText
 
-			// Extract text parts from the message
-			const isTextPart = (p: Part): p is TextPart => p.type === "text"
-			const textParts = lastMessage.parts.filter(isTextPart)
-
-			if (textParts.length === 0) {
-				await this.debugLog(
-					`getResult: No text parts found in message: ${JSON.stringify(lastMessage)}`,
-				)
-				return `Delegation "${delegation.description}" completed but produced no text content.`
+			// Reasoning models sometimes end on a reasoning-only message; walk back
+			// to the most recent assistant message that produced real text.
+			for (let i = assistantMessages.length - 2; i >= 0; i--) {
+				const text = extractText(assistantMessages[i])
+				if (text !== null) {
+					await this.debugLog(
+						`getResult: final message had no text parts; using assistant message ${i} of ${assistantMessages.length}`,
+					)
+					return text
+				}
 			}
 
-			return textParts.map((p) => p.text).join("\n")
+			// Last resort: surface the reasoning trace instead of dropping output.
+			const isReasoningPart = (p: Part): p is ReasoningPart => p.type === "reasoning"
+			const reasoningText = lastMessage.parts
+				.filter(isReasoningPart)
+				.map((p) => p.text)
+				.filter((text) => text.trim().length > 0)
+				.join("\n")
+			if (reasoningText.trim().length > 0) {
+				await this.debugLog(`getResult: no text parts anywhere; returning reasoning trace`)
+				return `[No final text was produced; showing the agent's reasoning trace]\n\n${reasoningText}`
+			}
+
+			await this.debugLog(
+				`getResult: No text parts found in message: ${JSON.stringify(lastMessage)}`,
+			)
+			return `Delegation "${delegation.id}" completed but produced no text content.`
 		} catch (error) {
 			await this.debugLog(
 				`getResult error: ${error instanceof Error ? error.message : "Unknown error"}`,
 			)
-			return `Delegation "${delegation.description}" completed but result could not be retrieved: ${
+			return `Delegation "${delegation.id}" completed but result could not be retrieved: ${
 				error instanceof Error ? error.message : "Unknown error"
 			}`
 		}
@@ -1334,18 +1657,16 @@ ${description}
 		}
 
 		if (isActiveStatus(delegation.status)) {
-			const remainingMs = Math.max(
-				delegation.timeoutAt.getTime() - Date.now() + this.terminalWaitGraceMs,
-				this.readPollIntervalMs,
-			)
-
+			// Bounded wait only: absorb the "read races completion" window, then
+			// report status instead of blocking. Reads must never kill delegations.
+			const waitMs = Math.max(this.harness.timeouts.readWaitMs, this.readPollIntervalMs)
 			await this.debugLog(
-				`readOutput: waiting up to ${remainingMs}ms for delegation ${delegation.id} to reach terminal state`,
+				`readOutput: waiting up to ${waitMs}ms for delegation ${delegation.id} to reach terminal state`,
 			)
 
-			const waitResult = await this.waitForTerminal(delegation.id, remainingMs)
+			const waitResult = await this.waitForTerminal(delegation.id, waitMs)
 			if (waitResult === "timeout" && isActiveStatus(delegation.status)) {
-				await this.handleTimeout(delegation.id)
+				return this.buildInFlightReadResponse(delegation)
 			}
 		}
 
@@ -1371,6 +1692,168 @@ ${description}
 		}
 
 		return `Delegation "${delegation.id}" is still running. You will receive a <task-notification> when it reaches a terminal state.`
+	}
+
+	private buildInFlightReadResponse(delegation: DelegationRecord): string {
+		const lines: string[] = []
+		if (delegation.status === "queued" || delegation.status === "registered") {
+			lines.push(`Delegation "${delegation.id}" is queued (not yet dispatched).`)
+			lines.push(
+				`It is waiting for a "${delegation.tier ?? "unknown"}" tier slot${
+					delegation.queuePosition ? ` (position ${delegation.queuePosition})` : ""
+				} and will start automatically when one frees.`,
+			)
+		} else {
+			lines.push(`Delegation "${delegation.id}" is still running.`)
+			if (delegation.dispatchedAt) {
+				lines.push(`Dispatched: ${delegation.dispatchedAt.toISOString()}`)
+			}
+			lines.push(`Last activity: ${delegation.lastActivityAt.toISOString()}`)
+		}
+		lines.push("You WILL be notified via <task-notification> when it completes. Do NOT poll.")
+		lines.push(
+			`To stop it: delegation_cancel("${delegation.id}"). For tier occupancy: agents_status().`,
+		)
+		return lines.join("\n")
+	}
+
+	/**
+	 * Cancel a delegation on behalf of a session (visibility-checked tool path).
+	 */
+	async cancelDelegation(sessionID: string, id: string): Promise<string> {
+		const normalizedId = normalizeId(id)
+		if (!normalizedId) {
+			throw new Error("Delegation ID is required")
+		}
+
+		const rootSessionID = await this.getRootSessionID(sessionID)
+		const delegation = this.delegations.get(normalizedId)
+		if (!delegation || !this.isVisibleToSession(delegation, rootSessionID)) {
+			throw new Error(
+				`Delegation "${normalizedId}" not found.\n\nUse delegation_list() to see available delegations.`,
+			)
+		}
+
+		return await this.cancelDelegationInternal(delegation.id, "Cancelled by orchestrator request")
+	}
+
+	/**
+	 * Cancel without a visibility check (workflow bridge and internal callers).
+	 */
+	async cancelDelegationInternal(id: string, reason: string): Promise<string> {
+		const delegation = this.delegations.get(normalizeId(id))
+		if (!delegation) {
+			throw new Error(`Delegation "${id}" not found.`)
+		}
+		if (isTerminalStatus(delegation.status)) {
+			return `Delegation "${delegation.id}" is already ${delegation.status}.`
+		}
+
+		const wasQueued = delegation.status !== "running"
+		if (!wasQueued) {
+			delegation.pendingTerminalStatus = "cancelled"
+			try {
+				await this.client.session.abort({ path: { id: delegation.sessionID } })
+			} catch {
+				// Session may already be idle
+			}
+		}
+
+		await this.finalizeDelegation(delegation.id, "cancelled", reason)
+		return wasQueued
+			? `Delegation "${delegation.id}" cancelled while queued; its tier slot was never consumed.`
+			: `Delegation "${delegation.id}" cancelled. Partial output (if any) was persisted to ${delegation.artifact.filePath}.`
+	}
+
+	/**
+	 * Await a delegation's terminal state and resolved result text. Used by the
+	 * workflow runtime; the optional signal cancels the delegation on abort.
+	 */
+	async awaitResult(id: string, opts: { signal?: AbortSignal } = {}): Promise<DelegationOutcome> {
+		const delegation = this.delegations.get(normalizeId(id))
+		if (!delegation) {
+			return { id, status: "error", text: "", error: `Unknown delegation "${id}"`, durationMs: 0 }
+		}
+		const startMs = delegation.createdAt.getTime()
+
+		if (!isTerminalStatus(delegation.status)) {
+			if (opts.signal?.aborted) {
+				await this.cancelDelegationInternal(delegation.id, "Cancelled by workflow abort").catch(
+					() => {},
+				)
+			} else {
+				const waiter = this.terminalWaiters.get(delegation.id)
+				if (waiter) {
+					let abortListener: (() => void) | undefined
+					try {
+						const raced = await Promise.race<"terminal" | "aborted">([
+							waiter.promise.then(() => "terminal" as const),
+							new Promise<"aborted">((resolve) => {
+								if (!opts.signal) return
+								abortListener = () => resolve("aborted")
+								opts.signal.addEventListener("abort", abortListener, { once: true })
+							}),
+						])
+						if (raced === "aborted") {
+							await this.cancelDelegationInternal(
+								delegation.id,
+								"Cancelled by workflow abort",
+							).catch(() => {})
+							await this.waitForTerminal(delegation.id, AWAIT_RESULT_SETTLE_MS)
+						}
+					} finally {
+						if (abortListener && opts.signal) {
+							opts.signal.removeEventListener("abort", abortListener)
+						}
+					}
+				}
+			}
+		}
+
+		// finalizeDelegation resolves the terminal waiter before it computes the
+		// result text; poll briefly until the result lands.
+		const settleDeadline = Date.now() + AWAIT_RESULT_SETTLE_MS
+		while (delegation.result === undefined && Date.now() < settleDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, this.readPollIntervalMs))
+		}
+
+		const status = isTerminalStatus(delegation.status) ? delegation.status : "error"
+		return {
+			id: delegation.id,
+			status,
+			text: delegation.result ?? "",
+			error: delegation.error,
+			durationMs: (delegation.completedAt?.getTime() ?? Date.now()) - startMs,
+		}
+	}
+
+	getScheduler(): TierScheduler | undefined {
+		return this.scheduler
+	}
+
+	getHarness(): HarnessConfig {
+		return this.harness
+	}
+
+	/** Active (running or queued) delegations visible to a root session. */
+	async describeActiveDelegations(sessionID: string): Promise<string[]> {
+		const rootSessionID = await this.getRootSessionID(sessionID)
+		const lines: string[] = []
+		const now = Date.now()
+		for (const delegation of this.delegations.values()) {
+			if (!this.isVisibleToSession(delegation, rootSessionID)) continue
+			if (!isActiveStatus(delegation.status)) continue
+			const elapsed = Math.round((now - delegation.createdAt.getTime()) / 1000)
+			const activity = Math.round((now - delegation.lastActivityAt.getTime()) / 1000)
+			const state =
+				delegation.status === "running"
+					? `running ${elapsed}s, last activity ${activity}s ago`
+					: `${delegation.status}${delegation.queuePosition ? ` (position ${delegation.queuePosition})` : ""}, waiting ${elapsed}s`
+			lines.push(
+				`- **${delegation.id}** (${delegation.agent}${delegation.modelOverride ? `, model ${delegation.modelOverride}` : ""}, tier ${delegation.tier ?? "uncapped"}): ${state}`,
+			)
+		}
+		return lines
 	}
 
 	/**
@@ -1573,6 +2056,7 @@ ${description}
 interface DelegateArgs {
 	prompt: string
 	agent: string
+	model?: string
 }
 
 function createDelegate(manager: DelegationManager): ReturnType<typeof tool> {
@@ -1584,6 +2068,7 @@ Use this for:
 - Parallel work that can run in background
 - Any task where you want persistent, retrievable output
 
+Capacity is limited per model tier; excess delegations queue and start automatically.
 On completion, a notification will arrive with the ID and terminal summary.
 Use \`delegation_read\` with the ID to retrieve full persisted output (including after compaction).`,
 		args: {
@@ -1594,6 +2079,12 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 				.string()
 				.describe(
 					'Agent to delegate to. Must be a read-only sub-agent (edit/write/bash denied), such as "researcher" or "explore".',
+				),
+			model: tool.schema
+				.string()
+				.optional()
+				.describe(
+					'Optional model override in "provider/model" form, e.g. "lmstudio/qwen/qwen3.6-27b" to escalate one call to the top model or "lmstudio/qwen/qwen3.6-35b-a3b" to economize. Affects tier scheduling.',
 				),
 		},
 		async execute(args: DelegateArgs, toolCtx: ToolContext): Promise<string> {
@@ -1611,13 +2102,19 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 					parentAgent: toolCtx.agent,
 					prompt: args.prompt,
 					agent: args.agent,
+					options: args.model ? { model: args.model } : undefined,
 				})
 
 				// Get total active count for this parent session
-				const pendingSet = manager.getPendingCount(toolCtx.sessionID)
-				const totalActive = pendingSet
+				const totalActive = manager.getPendingCount(toolCtx.sessionID)
 
 				let response = `Delegation started: ${delegation.id}\nAgent: ${args.agent}`
+				if (args.model) {
+					response += `\nModel override: ${args.model}`
+				}
+				if (delegation.tier) {
+					response += `\nTier: ${delegation.tier} (capacity-managed; if slots are busy this queues and starts automatically)`
+				}
 				if (totalActive > 1) {
 					response += `\n\n${totalActive} delegations now active.`
 				}
@@ -1628,6 +2125,74 @@ Use \`delegation_read\` with the ID to retrieve full persisted output (including
 				// Return validation errors as guidance, not exceptions
 				return `❌ Delegation failed:\n\n${error instanceof Error ? error.message : "Unknown error"}`
 			}
+		},
+	})
+}
+
+function createDelegationCancel(manager: DelegationManager): ReturnType<typeof tool> {
+	return tool({
+		description: `Cancel a queued or running delegation by its ID.
+Queued delegations are removed without consuming a model slot; running delegations are aborted and their partial output is persisted.`,
+		args: {
+			id: tool.schema.string().describe("The delegation ID (e.g., 'elegant-blue-tiger')"),
+		},
+		async execute(args: { id: string }, toolCtx: ToolContext): Promise<string> {
+			if (!toolCtx?.sessionID) {
+				return "❌ delegation_cancel requires sessionID. This is a system error."
+			}
+			try {
+				return await manager.cancelDelegation(toolCtx.sessionID, args.id)
+			} catch (error) {
+				return `❌ Cancel failed:\n\n${error instanceof Error ? error.message : "Unknown error"}`
+			}
+		},
+	})
+}
+
+function createAgentsStatus(manager: DelegationManager): ReturnType<typeof tool> {
+	return tool({
+		description: `Show model-tier slot occupancy (machine-wide) and this session's active delegations.
+Call this ONCE when you want a snapshot of background capacity; never poll it.`,
+		args: {},
+		async execute(_args: Record<string, never>, toolCtx: ToolContext): Promise<string> {
+			if (!toolCtx?.sessionID) {
+				return "❌ agents_status requires sessionID. This is a system error."
+			}
+
+			const sections: string[] = ["## Agent Capacity"]
+			const scheduler = manager.getScheduler()
+			if (!scheduler) {
+				sections.push("Scheduler disabled: no tiers configured, all work dispatches immediately.")
+			} else {
+				const tiers = await scheduler.status()
+				const now = Date.now()
+				for (const tier of tiers) {
+					sections.push(`\n### Tier "${tier.name}": ${tier.holders.length}/${tier.maxConcurrent} slots in use`)
+					for (const holder of tier.holders) {
+						const heldSeconds = Math.round((now - holder.acquiredAt) / 1000)
+						const origin = holder.pid === process.pid ? "this process" : `pid ${holder.pid}`
+						sections.push(
+							`- slot ${holder.slot}: ${holder.kind}${holder.agent ? ` → ${holder.agent}` : ""}${holder.jobId ? ` (${holder.jobId})` : ""}, held ${heldSeconds}s, ${origin}`,
+						)
+					}
+					for (const [index, waiting] of tier.localQueue.entries()) {
+						sections.push(
+							`- queued #${index + 1}: ${waiting.kind}${waiting.agent ? ` → ${waiting.agent}` : ""}${waiting.jobId ? ` (${waiting.jobId})` : ""}, waiting ${Math.round(waiting.waitingMs / 1000)}s`,
+						)
+					}
+				}
+				sections.push(
+					"\nSlot occupancy is machine-wide (all opencode instances); the queue shown is this process's.",
+				)
+			}
+
+			const active = await manager.describeActiveDelegations(toolCtx.sessionID)
+			if (active.length > 0) {
+				sections.push("\n## Active Delegations (this session)")
+				sections.push(...active)
+			}
+
+			return sections.join("\n")
 		},
 	})
 }
@@ -1681,15 +2246,16 @@ Shows both running and completed delegations.`,
 // DELEGATION RULES (injected into system prompt)
 // ==========================================
 
-const DELEGATION_RULES = `<task-notification>
-<delegation-system>
+const DELEGATION_RULES = `<delegation-system>
 
 ## Async Delegation
 
 You have tools for parallel background work:
-- \`delegate(prompt, agent)\` - Launch task, returns ID immediately
+- \`delegate(prompt, agent, model?)\` - Launch task, returns ID immediately. Optional \`model\` ("provider/model") escalates or economizes one call, e.g. "lmstudio/qwen/qwen3.6-27b".
 - \`delegation_read(id)\` - Retrieve completed result
 - \`delegation_list()\` - List delegations (use sparingly)
+- \`delegation_cancel(id)\` - Stop a queued or running delegation
+- \`agents_status()\` - Snapshot of tier slots (machine-wide) and queued work
 
 ## Delegation Routing
 
@@ -1702,6 +2268,16 @@ Agents route based on their permissions:
 
 **Read-only sub-agents** have edit="deny", write="deny", bash={"*":"deny"}.
 **Write-capable sub-agents** have any write tool enabled.
+
+## Concurrency and Queueing
+
+Local model capacity is limited and shared machine-wide (defaults: top tier 1
+concurrent, fast tier 3). Work beyond capacity QUEUES and starts automatically
+when a slot frees. There is no wall-clock time limit; only genuinely stalled
+agents are reaped.
+- "queued" is normal and needs no action. Do NOT resubmit duplicates.
+- If progress seems slow, call \`agents_status()\` ONCE. Never poll it.
+- You will ALWAYS receive a \`<task-notification>\` per completed delegation.
 
 ## How It Works
 
@@ -1720,8 +2296,7 @@ You WILL be notified via \`<task-notification>\`. Polling wastes tokens.
 
 **Using wrong tool will fail fast with guidance.**
 
-</delegation-system>
-</task-notification>`
+</delegation-system>`
 
 // ==========================================
 // COMPACTION CONTEXT FORMATTING
@@ -1838,7 +2413,71 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	// Ensure base directory exists (for debug logs etc)
 	await fs.mkdir(baseDir, { recursive: true })
 
-	const manager = new DelegationManager(client as OpencodeClient, baseDir, log)
+	// Harness config drives the tier scheduler, timeout policy, and metadata mode
+	const { config: harness, warnings } = await loadHarnessConfig(directory)
+	for (const warning of warnings) {
+		log.warn(warning)
+	}
+	const scheduler = harness.tiers.length > 0 ? getScheduler(harness, log) : undefined
+	if (scheduler) await scheduler.init()
+	const resolver = scheduler
+		? createTierResolver(client as OpencodeClient, scheduler, log)
+		: undefined
+
+	const manager = new DelegationManager(client as OpencodeClient, baseDir, log, {
+		harness,
+		scheduler,
+		resolver,
+	})
+	manager.startInactivityWatchdog()
+
+	// Bridge for the workflow plugin: same queue, same lifecycle, silent results.
+	registerDelegationHandle({
+		delegate: (input) => manager.delegate(input).then((delegation) => ({ id: delegation.id })),
+		awaitResult: (id, opts) => manager.awaitResult(id, opts),
+		cancel: async (id) => {
+			await manager.cancelDelegationInternal(id, "Cancelled by workflow").catch(() => {})
+		},
+	})
+
+	// Native task gating state: leases held for in-flight task tool calls and
+	// abort controllers for calls still waiting on a slot.
+	const taskLeases = new Map<string, Lease>()
+	const taskWaitAborts = new Map<string, { controller: AbortController; sessionID: string }>()
+
+	const releaseTaskResourcesForSession = (sessionID: string) => {
+		for (const [callID, waiting] of taskWaitAborts) {
+			if (waiting.sessionID === sessionID) {
+				taskWaitAborts.delete(callID)
+				waiting.controller.abort()
+			}
+		}
+		for (const [callID, lease] of taskLeases) {
+			if (lease.info.sessionID === sessionID) {
+				taskLeases.delete(callID)
+				void lease.release()
+			}
+		}
+	}
+
+	// Safety net: tool.execute.after does not fire for tools that error, so a
+	// failed task call could hold its tier slot until the parent goes idle.
+	// Reap anything held implausibly long.
+	const taskLeaseStaleMs =
+		harness.timeouts.toolCallStaleMs > 0
+			? harness.timeouts.toolCallStaleMs
+			: TASK_LEASE_STALE_FALLBACK_MS
+	const taskLeaseSweep = setInterval(() => {
+		const now = Date.now()
+		for (const [callID, lease] of taskLeases) {
+			if (now - lease.info.acquiredAt > taskLeaseStaleMs) {
+				taskLeases.delete(callID)
+				void lease.release()
+				log.warn(`released stale task lease for call ${callID}`)
+			}
+		}
+	}, 60_000)
+	taskLeaseSweep.unref?.()
 
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
 
@@ -1847,13 +2486,29 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			delegate: createDelegate(manager),
 			delegation_read: createDelegationRead(manager),
 			delegation_list: createDelegationList(manager),
+			delegation_cancel: createDelegationCancel(manager),
+			agents_status: createAgentsStatus(manager),
 		},
 
-		// Prevent read-only agents from using native task tool (symmetric to delegate enforcement)
+		dispose: async () => {
+			manager.stopInactivityWatchdog()
+			clearInterval(taskLeaseSweep)
+			for (const [, lease] of taskLeases) {
+				await lease.release()
+			}
+			taskLeases.clear()
+			if (scheduler) await scheduler.dispose()
+		},
+
+		// Route read-only agents to delegate, and gate write-capable native task
+		// calls through the tier scheduler so they share the machine-wide caps.
 		"tool.execute.before": async (
-			input: { tool: string },
+			input: { tool: string; sessionID: string; callID: string },
 			output: { args?: { subagent_type?: string } },
 		) => {
+			// Track tool activity inside delegation child sessions (watchdog input)
+			manager.noteToolStart(input.sessionID, input.callID)
+
 			// Guard: Only intercept task tool
 			if (input.tool !== "task") return
 
@@ -1874,16 +2529,59 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 				log,
 			)
 
-			// Guard: Allow write-capable agents
-			if (!isReadOnly) return
+			// Fail fast: Read-only sub-agent via task is invalid. This throw MUST
+			// stay ahead of slot acquisition so rejected calls never leak a lease.
+			if (isReadOnly) {
+				throw new Error(
+					`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
+						`Read-only agents have: edit="deny", write="deny", bash={"*":"deny"}\n` +
+						`Use delegate for read-only sub-agents.\n` +
+						`Use task for write-capable sub-agents.`,
+				)
+			}
 
-			// Fail fast: Read-only sub-agent via task is invalid
-			throw new Error(
-				`❌ Agent '${agentName}' is read-only and should use the delegate tool for async background execution.\n\n` +
-					`Read-only agents have: edit="deny", write="deny", bash={"*":"deny"}\n` +
-					`Use delegate for read-only sub-agents.\n` +
-					`Use task for write-capable sub-agents.`,
-			)
+			// Write-capable native task: hold a tier slot for the duration.
+			if (!scheduler || !resolver) return
+			const { tier } = await resolver.resolveAgentTier(agentName)
+			if (!tier) return
+
+			const controller = new AbortController()
+			taskWaitAborts.set(input.callID, { controller, sessionID: input.sessionID })
+			try {
+				const lease = await scheduler.acquire(tier, {
+					kind: "task",
+					agent: agentName,
+					sessionID: input.sessionID,
+					jobId: input.callID,
+					signal: controller.signal,
+					maxWaitMs: harness.timeouts.queueWaitMs,
+				})
+				taskLeases.set(input.callID, lease)
+			} catch (error) {
+				if (error instanceof AcquireAbortedError) {
+					throw new Error("Task cancelled while waiting for a model slot.")
+				}
+				if (error instanceof QueueWaitTimeoutError) {
+					throw new Error(
+						`Tier "${tier}" is saturated: ${error.message}. Check agents_status() for occupancy, or use delegate for async background work.`,
+					)
+				}
+				throw error
+			} finally {
+				taskWaitAborts.delete(input.callID)
+			}
+		},
+
+		// Release task slots when the task tool finishes, and track tool-call
+		// completion for the inactivity watchdog.
+		"tool.execute.after": async (input: { tool: string; sessionID: string; callID: string }) => {
+			manager.noteToolEnd(input.sessionID, input.callID)
+			if (input.tool !== "task") return
+			const lease = taskLeases.get(input.callID)
+			if (lease) {
+				taskLeases.delete(input.callID)
+				await lease.release()
+			}
 		},
 
 		// Inject delegation rules into system prompt
@@ -1941,6 +2639,7 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 				const statusType = event.properties.status?.type
 				const sessionID = event.properties.sessionID
 				if (statusType === "idle" && sessionID) {
+					releaseTaskResourcesForSession(sessionID)
 					await manager.handleSessionIdle(sessionID)
 				}
 			}
@@ -1948,7 +2647,16 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			if (event.type === "session.idle") {
 				const sessionID = event.properties.sessionID
 				if (sessionID) {
+					releaseTaskResourcesForSession(sessionID)
 					await manager.handleSessionIdle(sessionID)
+				}
+			}
+
+			if (event.type === "message.part.updated") {
+				const partProperties = event.properties as { part?: { sessionID?: string } }
+				const partSessionID = partProperties.part?.sessionID
+				if (partSessionID) {
+					manager.recordActivity(partSessionID)
 				}
 			}
 

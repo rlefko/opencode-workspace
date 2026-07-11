@@ -1,0 +1,41 @@
+{
+	// Harness configuration for the tiered agent scheduler and delegation lifecycle.
+	// Loaded by plugins/lib/harness-config.ts. A project can override any top-level
+	// key with its own .opencode/harness.jsonc (shallow merge, project wins).
+	"tiers": [
+		{ "name": "top", "models": ["lmstudio/qwen/qwen3.6-27b"], "maxConcurrent": 1 },
+		{ "name": "fast", "models": ["lmstudio/qwen/qwen3.6-35b-a3b"], "maxConcurrent": 3 }
+	],
+	// Tier for models that match no tier list. null means uncapped (correct for
+	// cloud providers, which do not contend for the local GPU).
+	"defaultTier": null,
+	"timeouts": {
+		// Wall-clock budget per delegation, armed at dispatch. 0 = unlimited.
+		"dispatchBudgetMs": 0,
+		// Kill a running delegation only when the model streams nothing AND no tool
+		// call is in flight for this long. 0 disables the watchdog entirely.
+		"inactivityMs": 900000,
+		// How long a single tool call may defer the watchdog. Remote MCP calls can
+		// hang forever without opencode reporting failure; after this the call is
+		// presumed dead. 0 = defer indefinitely.
+		"toolCallStaleMs": 2700000,
+		// How long queued work may wait for a tier slot. 0 = wait indefinitely.
+		"queueWaitMs": 0,
+		// How long delegation_read waits for an in-flight delegation before
+		// returning a status message instead of blocking.
+		"readWaitMs": 10000
+	},
+	"scheduler": {
+		// Share tier slots across every opencode process on this machine.
+		"crossProcess": true,
+		"leaseDir": "~/.local/share/opencode/workspace/scheduler",
+		"heartbeatMs": 15000,
+		"staleMs": 60000,
+		"pollMs": 500
+	},
+	"metadata": {
+		// When true, each finished delegation makes an extra small_model LLM call
+		// to generate a title/description. Off by default: truncation is free.
+		"useLlm": false
+	}
+}

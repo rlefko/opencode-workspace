@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
+import type { Event } from "@opencode-ai/sdk"
 import { z } from "zod"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 
@@ -294,10 +295,14 @@ interface SystemTransformInput {
 // ==========================================
 
 /** Tracks in-flight coder task callIDs with timestamps for stale cleanup */
-const activeCoderCalls = new Map<string, { startTime: number }>()
+const activeCoderCalls = new Map<string, { startTime: number; sessionID?: string }>()
 
-/** Stale call timeout - matches MAX_RUN_TIME_MS in background-agents.ts */
-const STALE_CALL_TIMEOUT_MS = 15 * 60 * 1000
+/**
+ * Stale call timeout for reminder bookkeeping only (nothing is killed here).
+ * Generous because local models run long; delegation lifecycles are governed
+ * by the harness scheduler, not this map.
+ */
+const STALE_CALL_TIMEOUT_MS = 3 * 60 * 60 * 1000
 
 /** Periodic cleanup of orphaned callIDs (runs every 60s) */
 const cleanupInterval = setInterval(() => {
@@ -316,50 +321,38 @@ cleanupInterval.unref?.()
 // ==========================================
 
 const PLAN_RULES = `<system-reminder>
-<workspace-routing policy_level="critical">
+<plan-mode policy_level="critical">
 
-## Agent Routing (STRICT BOUNDARIES)
+## Plan Mode
 
-| Agent | Scope | Use For |
-|-------|-------|---------|
-| \`explore\` | **INTERNAL ONLY** - codebase files | Find files, understand code structure, trace logic |
-| \`researcher\` | **EXTERNAL ONLY** - outside codebase | Documentation, websites, npm packages, APIs, tutorials |
-| \`scribe\` | Human-facing content | Documentation drafts, commit messages, PR descriptions |
+You are in PLAN MODE: read-only exploration ending in a saved plan. You do not
+change code, run write commands, or commit. Your deliverable is understanding
+plus a plan the build agent can execute.
 
-## Critical Constraints
+### How to work
+1. **Explore directly.** Read files, grep, glob, and inspect git yourself for
+   targeted questions. This is normal and expected.
+2. **Delegate broad sweeps.** For wide codebase reconnaissance use
+   \`delegate\` to \`explore\`; for external docs/APIs/packages use \`researcher\`.
+   Fan out several delegations in parallel when areas are independent; for a
+   coordinated multi-agent sweep use the \`workflow\` tool.
+3. **Ask when it matters.** If requirements are ambiguous, ask the user
+   focused questions before locking the plan. Do not guess intent.
+4. **Honor project instructions.** Read CLAUDE.md / AGENTS.md for project
+   rules; if they mandate pre-commit review dimensions, the plan MUST include
+   a parallel review phase before any commit step.
 
-**You are a READ-ONLY orchestrator. You coordinate research, you do NOT search yourself.**
+### Agent routing
+| Agent | Scope |
+|-------|-------|
+| \`explore\` | INTERNAL codebase sweeps (no web access) |
+| \`researcher\` | EXTERNAL docs, websites, packages (no codebase) |
 
-- \`explore\` CANNOT access external resources (docs, web, APIs)
-- \`researcher\` CANNOT search codebase files
-- For external docs about a library used in the codebase → \`researcher\`
-- For how that library is used in THIS codebase → \`explore\`
-
-<example>
-User: "What does the OpenAI API say about function calling?"
-Correct: delegate to researcher (EXTERNAL - API documentation)
-Wrong: Try to answer from memory or use MCP tools directly
-</example>
-
-<example>
-User: "Where is the auth middleware in this project?"
-Correct: delegate to explore (INTERNAL - codebase search)
-Wrong: Use grep/glob directly
-</example>
-
-<example>
-User: "How should I implement OAuth2 in this project?"
-Correct: 
-  1. delegate to researcher for OAuth2 best practices (EXTERNAL)
-  2. delegate to explore for existing auth patterns (INTERNAL)
-Wrong: Search codebase yourself or answer from memory
-</example>
-
-</workspace-routing>
+</plan-mode>
 
 <philosophy>
-Load relevant skills before finalizing plan:
-- Planning work → \`skill\` load \`plan-protocol\` (REQUIRED before using plan_save)
+Load relevant skills before finalizing the plan:
+- Planning work → \`skill\` load \`plan-protocol\` (REQUIRED before plan_save)
 - Backend/logic work → \`skill\` load \`code-philosophy\`
 - UI/frontend work → \`skill\` load \`frontend-philosophy\`
 </philosophy>
@@ -400,114 +393,75 @@ updated: YYYY-MM-DD
 2. **Cite decisions** - Use \`ref:delegation-id\` for research-informed choices
 3. **Update immediately** - Mark tasks complete right after finishing
 4. **Auto-save after approval** - When user approves your plan, immediately call \`plan_save\`. Do NOT wait for user to remind you or switch modes.
+5. **Pre-commit review phase** - If the project mandates review dimensions (CLAUDE.md/AGENTS.md), include a phase that runs them in parallel before any commit task.
 </plan-format>
 
 <instruction name="plan_persistence" policy_level="critical">
 
-## Plan Mode Active
-You are in PLAN MODE. Your primary deliverable is a saved implementation plan.
-
-## Requirements
+## Deliverable
 1. **First**: Load the \`plan-protocol\` skill to understand the required plan schema
 2. **During**: Collaborate with the user to develop a comprehensive, well-cited plan
-3. **Before exiting**: You MUST call \`plan_save\` with the finalized plan
+3. **Before exiting**: You MUST call \`plan_save\` with the finalized plan, then suggest switching to the build agent to execute it
 
-## CRITICAL
 Saving your plan is a REQUIREMENT, not a request. Plans that are not saved will be lost when the session ends or mode changes. The user cannot see your plan unless you save it.
 
 </instruction>
 </system-reminder>`
 
 const BUILD_RULES = `<system-reminder>
-<delegation-mandate policy_level="critical">
+<build-mode policy_level="critical">
 
-## You Are an ORCHESTRATOR
+## Build Mode
 
-You coordinate work. You do NOT implement.
+You are the primary engineer. Implement directly: read, edit, write, and run
+commands yourself. Delegate only when it buys parallelism or protects your
+context, exactly like a lead engineer using teammates.
 
-**CRITICAL CONSTRAINTS:**
-- ALL code changes → delegate to \`coder\`
-- ALL documentation → delegate to \`scribe\`
-- Codebase questions → delegate to \`explore\` (INTERNAL only)
-- External docs/APIs → delegate to \`researcher\` (EXTERNAL only)
+### How to work
+1. **Track multi-step work with todos.** Use \`todowrite\` for any task with 3+
+   steps; update it as you go so the user sees progress.
+2. **Orient first.** If a plan exists, \`plan_read\` it. Check
+   \`delegation_list\` ONCE for prior research; reuse its findings.
+3. **Implement directly.** Small and medium edits are YOUR job. Do not
+   delegate what you can do in a few tool calls.
+4. **Delegate for scale.** Use \`task\` with \`coder\` for a big independent
+   implementation chunk; \`delegate\` to \`explore\`/\`researcher\` for
+   background reconnaissance; the \`workflow\` tool for coordinated
+   multi-agent fan-outs (parallel reviews, per-file pipelines, deep research).
+5. **Verify your work.** Run the project's build/lint/tests after changes.
+   Do not claim success without evidence.
+6. **Load philosophy skills before significant code:** frontend work →
+   \`skill\` load \`frontend-philosophy\`; backend/logic → \`code-philosophy\`.
 
-**You may directly:**
-- Read files for quick context
+### Agent routing
+| Agent | Scope |
+|-------|-------|
+| \`coder\` | Large independent implementation chunks (top model) |
+| \`explore\` | INTERNAL codebase sweeps (no web access) |
+| \`researcher\` | EXTERNAL docs, websites, packages (no codebase) |
+| \`reviewer\` | Code review dimensions |
+| \`scribe\` | Long-form human-facing documents |
 
-**You may NOT:**
-- Edit or write any files
-- Run bash commands (delegate verification to \`coder\`)
+</build-mode>
 
-## Verification Workflow
-For any command execution (bun check, bun test, git operations):
-1. Delegate to \`coder\` with specific instructions
-2. Coder runs commands and reports results
-3. You interpret results and decide next actions
+<code-review-protocol policy_level="critical">
 
-\`coder\` is your execution proxy for ALL bash operations.
+## Pre-Commit and Completion Review (MANDATORY)
 
-</delegation-mandate>
+Before ANY git commit, and before reporting completion:
+1. Check project instructions (CLAUDE.md / AGENTS.md) for mandated review
+   dimensions (for example: "run reuse, simplification, readability,
+   performance, and feel subagents before committing").
+2. If dimensions are mandated: fan out ONE \`delegate\` call PER dimension IN
+   PARALLEL to \`reviewer\`. Each prompt names the dimension, the changed
+   files, and any project skill to load (e.g. \`perf-review\`). The
+   \`workflow\` tool's parallel fan-out is ideal for this.
+3. If no dimensions are mandated: one \`reviewer\` pass over the changed files.
+4. Wait for the review notifications, apply critical (🔴) and major (🟠)
+   findings, THEN commit or report completion.
 
-<workspace-routing policy_level="critical">
-
-## Agent Routing (STRICT BOUNDARIES)
-
-| Agent | Scope | Use For |
-|-------|-------|---------|
-| \`explore\` | **INTERNAL ONLY** - codebase files | Find files, understand code structure, trace logic |
-| \`researcher\` | **EXTERNAL ONLY** - outside codebase | Documentation, websites, npm packages, APIs, tutorials |
-| \`coder\` | Implementation | Write/edit code, run builds and tests |
-| \`scribe\` | Human-facing content | Documentation, commit messages, PR descriptions |
-
-## Boundary Rules
-
-- \`explore\` CANNOT access external resources (docs, web, APIs)
-- \`researcher\` CANNOT search codebase files
-- \`coder\` handles ALL code modifications
-- \`scribe\` handles ALL human-facing content
-
-</workspace-routing>
-
-<build-workflow>
-
-### Before Writing Code
-1. Call \`plan_read\` to get the current plan
-2. Call \`delegation_list\` ONCE to see available research
-3. Call \`delegation_read\` for relevant findings
-4. **REUSE code snippets from researcher research** - they are production-ready
-
-### Philosophy Loading
-Load the relevant skill BEFORE delegating to coder:
-- Frontend work → \`skill\` load \`frontend-philosophy\`
-- Backend work → \`skill\` load \`code-philosophy\`
-
-### Execution
-1. Orient: Read plan with \`plan_read\` and check delegation findings
-2. Load: Load relevant philosophy skill(s)
-3. Delegate: Send implementation tasks to \`coder\`
-4. Verify: Check coder's results, run \`bun check\` if needed
-5. Document: Delegate doc updates to \`scribe\`
-6. Update: Mark tasks complete in plan
-
-</build-workflow>
-
-<code-review-protocol>
-
-## Code Review Protocol
-
-When implementation is complete (all plan steps done OR user's request fulfilled):
-1. BEFORE reporting completion to the user
-2. Delegate to \`reviewer\` agent with the list of changed files
-3. Include review findings in your completion report
-4. If critical (🔴) or major (🟠) issues found, offer to fix them
-
-Do NOT skip this step. Do NOT ask permission to review.
-The user expects reviewed code, not just implemented code.
-
-Review triggers:
-- All plan tasks marked complete
-- User's implementation request fulfilled
-- Before saying "done" or "complete"
+Do NOT skip this. Do NOT ask permission to review. Never commit unreviewed
+code. The user expects reviewed code, not just implemented code.
 
 </code-review-protocol>
 </system-reminder>`
@@ -621,14 +575,41 @@ Today is ${today}. When searching for documentation, APIs, or external resources
 
 		// Track coder task starts for review trigger
 		"tool.execute.before": async (
-			input: { tool: string; callID?: string },
+			input: { tool: string; sessionID?: string; callID?: string },
 			output: { args?: { subagent_type?: string } },
 		) => {
 			if (input.tool !== "task") return
 			if (!input.callID) return
 			if (output.args?.subagent_type !== "coder") return
 
-			activeCoderCalls.set(input.callID, { startTime: Date.now() })
+			activeCoderCalls.set(input.callID, {
+				startTime: Date.now(),
+				sessionID: input.sessionID,
+			})
+		},
+
+		// Clear tracked coder calls whose parent went idle without a matching
+		// tool.execute.after (aborted turns, tool errors); otherwise the review
+		// reminder never fires again for that session.
+		event: async ({ event }: { event: Event }) => {
+			let idleSessionID: string | undefined
+			if (event.type === "session.idle") {
+				idleSessionID = event.properties.sessionID
+			} else if (event.type === "session.status") {
+				const properties = event.properties as {
+					sessionID?: string
+					status?: { type?: string }
+				}
+				if (properties.status?.type === "idle") {
+					idleSessionID = properties.sessionID
+				}
+			}
+			if (!idleSessionID) return
+			for (const [callID, data] of activeCoderCalls) {
+				if (data.sessionID === idleSessionID) {
+					activeCoderCalls.delete(callID)
+				}
+			}
 		},
 
 		// Trigger review reminder when plan_save or all coder tasks complete
@@ -636,8 +617,10 @@ Today is ${today}. When searching for documentation, APIs, or external resources
 			input: { tool: string; sessionID: string; callID: string },
 			output: { title: string; output: string; metadata: unknown },
 		) => {
-			// Plan save triggers reviewer delegation reminder
+			// Plan save triggers reviewer delegation reminder (only on success:
+			// validation failures return a ❌ string and save nothing)
 			if (input.tool === "plan_save") {
+				if (output.output.trimStart().startsWith("❌")) return
 				output.output += `\n\n<system-reminder>
 Plan saved successfully. You MUST now delegate to the reviewer:
 1. Use the \`delegate\` tool to send the plan to the \`reviewer\` agent
@@ -656,10 +639,12 @@ Plan saved successfully. You MUST now delegate to the reviewer:
 
 			if (activeCoderCalls.size === 0) {
 				output.output += `\n\n<system-reminder>
-Coder task complete. Proceed to code review:
-1. Delegate to \`reviewer\` agent with the changed files
+Coder task complete. Proceed to code review BEFORE committing or reporting done:
+1. Check CLAUDE.md/AGENTS.md for mandated review dimensions; if present, fan
+   out one parallel \`delegate\` to \`reviewer\` per dimension (changed files +
+   any project skill to load). Otherwise run a single \`reviewer\` pass.
 2. Include findings in your completion report
-3. Offer to fix any critical/major issues found
+3. Fix critical/major issues before committing
 </system-reminder>`
 			}
 		},
@@ -698,7 +683,7 @@ ${planContent}
 ${currentTask ? `Current task: ${currentTask}` : "No task marked as CURRENT"}
 
 ## Verification
-To verify any cited decision, use \`delegation_read("ref:id")\`.
+To verify a decision cited as \`ref:some-id\`, call \`delegation_read("some-id")\` (the ref: prefix is optional).
 </workspace-context>`)
 		},
 	}
