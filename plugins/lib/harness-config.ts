@@ -30,6 +30,12 @@ const HarnessSchema = z.object({
 		dispatchBudgetMs: z.number().int().min(0),
 		/** Max quiet time (no stream output, no tool in flight). 0 = disabled. */
 		inactivityMs: z.number().int().min(0),
+		/**
+		 * How long a single tool call may defer the inactivity watchdog. Remote
+		 * MCP calls can hang forever and opencode never reports their failure;
+		 * after this long the call is presumed dead. 0 = defer indefinitely.
+		 */
+		toolCallStaleMs: z.number().int().min(0),
 		/** Max time queued work waits for a tier slot. 0 = wait indefinitely. */
 		queueWaitMs: z.number().int().min(0),
 		/** Bounded wait used by delegation_read on in-flight delegations. */
@@ -59,6 +65,7 @@ export const HARNESS_DEFAULTS: HarnessConfig = {
 	timeouts: {
 		dispatchBudgetMs: 0,
 		inactivityMs: 900_000,
+		toolCallStaleMs: 2_700_000,
 		queueWaitMs: 0,
 		readWaitMs: 10_000,
 	},

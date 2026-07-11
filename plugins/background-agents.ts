@@ -287,9 +287,9 @@ const ALL_COMPLETE_QUIET_PERIOD_MS = 50
 const PARENT_NOTIFICATION_TIMEOUT_MS = 5_000
 const INACTIVITY_SWEEP_INTERVAL_MS = 30_000
 const AWAIT_RESULT_SETTLE_MS = 10_000
-// tool.execute.after does not fire for tools that error; entries older than
-// this are treated as leaked so the watchdog (and slot release) can recover.
-const TOOL_CALL_STALE_MS = 3 * 60 * 60 * 1000
+// Fallback when harness config is absent: how long a task lease may be held
+// before the sweep presumes its tool call died without an after-hook.
+const TASK_LEASE_STALE_FALLBACK_MS = 45 * 60 * 1000
 
 interface DelegateInput {
 	parentSessionID: string
@@ -1414,12 +1414,18 @@ class DelegationManager {
 		for (const delegation of this.delegations.values()) {
 			if (delegation.status !== "running") continue
 
-			// opencode does not fire tool.execute.after for tools that error, so
-			// in-flight entries can leak. Purge ancient ones so a single failed
-			// tool call cannot disarm the watchdog forever.
-			for (const [callID, startedAtMs] of delegation.activeToolCallIDs) {
-				if (now - startedAtMs > TOOL_CALL_STALE_MS) {
-					delegation.activeToolCallIDs.delete(callID)
+			// opencode does not fire tool.execute.after for tools that error, and
+			// remote MCP calls can hang forever. Purge entries past the deference
+			// cap so one dead tool call cannot disarm the watchdog indefinitely.
+			const toolCallStaleMs = this.harness.timeouts.toolCallStaleMs
+			if (toolCallStaleMs > 0) {
+				for (const [callID, startedAtMs] of delegation.activeToolCallIDs) {
+					if (now - startedAtMs > toolCallStaleMs) {
+						delegation.activeToolCallIDs.delete(callID)
+						await this.debugLog(
+							`inactivity watchdog: presuming dead tool call ${callID} in ${delegation.id} (in flight ${Math.round((now - startedAtMs) / 60_000)}m)`,
+						)
+					}
 				}
 			}
 
@@ -2457,10 +2463,14 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 	// Safety net: tool.execute.after does not fire for tools that error, so a
 	// failed task call could hold its tier slot until the parent goes idle.
 	// Reap anything held implausibly long.
+	const taskLeaseStaleMs =
+		harness.timeouts.toolCallStaleMs > 0
+			? harness.timeouts.toolCallStaleMs
+			: TASK_LEASE_STALE_FALLBACK_MS
 	const taskLeaseSweep = setInterval(() => {
 		const now = Date.now()
 		for (const [callID, lease] of taskLeases) {
-			if (now - lease.info.acquiredAt > TOOL_CALL_STALE_MS) {
+			if (now - lease.info.acquiredAt > taskLeaseStaleMs) {
 				taskLeases.delete(callID)
 				void lease.release()
 				log.warn(`released stale task lease for call ${callID}`)

@@ -15,6 +15,10 @@
 		// Kill a running delegation only when the model streams nothing AND no tool
 		// call is in flight for this long. 0 disables the watchdog entirely.
 		"inactivityMs": 900000,
+		// How long a single tool call may defer the watchdog. Remote MCP calls can
+		// hang forever without opencode reporting failure; after this the call is
+		// presumed dead. 0 = defer indefinitely.
+		"toolCallStaleMs": 2700000,
 		// How long queued work may wait for a tier slot. 0 = wait indefinitely.
 		"queueWaitMs": 0,
 		// How long delegation_read waits for an in-flight delegation before
