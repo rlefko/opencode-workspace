@@ -60,6 +60,11 @@ export interface RunWorkflowScriptOptions {
 		agentsCompleted: number
 	}): void
 	defaultAgent?: string
+	/**
+	 * Restrict spawned agents to read-only ones (plan-mode semantics): the
+	 * delegation manager's read-only guard stays active instead of bypassed.
+	 */
+	enforceReadOnly?: boolean
 }
 
 export async function runWorkflowScript(
@@ -108,11 +113,6 @@ export async function runWorkflowScript(
 		if (typeof prompt !== "string" || prompt.trim().length === 0) {
 			throw new Error("agent(prompt) requires a non-empty string prompt")
 		}
-		if (agentsStarted >= WORKFLOW_LIMITS.maxAgentsPerRun) {
-			throw new Error(
-				`Workflow agent budget exhausted (${WORKFLOW_LIMITS.maxAgentsPerRun} agent calls per run)`,
-			)
-		}
 		if (agentOptions.model && !splitModelRef(agentOptions.model)) {
 			throw new Error(
 				`Invalid model "${agentOptions.model}". Use "provider/model" form, e.g. "lmstudio/qwen/qwen3.6-27b".`,
@@ -121,7 +121,6 @@ export async function runWorkflowScript(
 
 		const agentName = agentOptions.agent ?? defaultAgent
 		const label = agentOptions.label ?? `${agentName}#${agentsStarted + 1}`
-		agentsStarted += 1
 		pushMetadata()
 
 		const fullPrompt = agentOptions.schema
@@ -138,6 +137,14 @@ export async function runWorkflowScript(
 		})
 
 		const runOnce = async (promptText: string): Promise<string> => {
+			// Budget counts every dispatch, including schema-repair retries.
+			if (agentsStarted >= WORKFLOW_LIMITS.maxAgentsPerRun) {
+				throw new Error(
+					`Workflow agent budget exhausted (${WORKFLOW_LIMITS.maxAgentsPerRun} agent calls per run)`,
+				)
+			}
+			agentsStarted += 1
+			pushMetadata()
 			const { id } = await handle.delegate({
 				parentSessionID: options.sessionID,
 				parentMessageID: options.messageID,
@@ -145,7 +152,7 @@ export async function runWorkflowScript(
 				prompt: promptText,
 				agent: agentName,
 				options: {
-					skipReadOnlyGuard: true,
+					skipReadOnlyGuard: !options.enforceReadOnly,
 					silent: true,
 					model: agentOptions.model,
 				},

@@ -256,6 +256,8 @@ interface DelegationRecord {
 	modelOverride?: string
 	silent: boolean
 	queuePosition?: number
+	/** Terminal status an abort-initiating caller intends; beats idle's "complete". */
+	pendingTerminalStatus?: DelegationTerminalStatus
 	notificationCycle: number
 	notificationCycleToken: string
 	status: DelegationStatus
@@ -266,7 +268,8 @@ interface DelegationRecord {
 	updatedAt: Date
 	timeoutAt?: Date
 	lastActivityAt: Date
-	activeToolCallIDs: Set<string>
+	/** callID -> started-at ms for tool calls in flight inside this session. */
+	activeToolCallIDs: Map<string, number>
 	progress: DelegationProgress
 	notification: DelegationNotificationState
 	retrieval: DelegationRetrievalState
@@ -284,6 +287,9 @@ const ALL_COMPLETE_QUIET_PERIOD_MS = 50
 const PARENT_NOTIFICATION_TIMEOUT_MS = 5_000
 const INACTIVITY_SWEEP_INTERVAL_MS = 30_000
 const AWAIT_RESULT_SETTLE_MS = 10_000
+// tool.execute.after does not fire for tools that error; entries older than
+// this are treated as leaked so the watchdog (and slot release) can recover.
+const TOOL_CALL_STALE_MS = 3 * 60 * 60 * 1000
 
 interface DelegateInput {
 	parentSessionID: string
@@ -433,7 +439,8 @@ function isActiveStatus(status: DelegationStatus): boolean {
 }
 
 function normalizeId(value: string): string {
-	return value.trim()
+	// Plan citations use "ref:<id>"; accept both forms everywhere IDs are read.
+	return value.trim().replace(/^ref:/, "")
 }
 
 function parsePersistedStatus(raw: string | undefined): DelegationStatus {
@@ -625,7 +632,7 @@ class DelegationManager {
 			createdAt: now,
 			updatedAt: now,
 			lastActivityAt: now,
-			activeToolCallIDs: new Set(),
+			activeToolCallIDs: new Map(),
 			progress: {
 				toolCalls: 0,
 				lastUpdateAt: now,
@@ -786,6 +793,9 @@ class DelegationManager {
 		for (const delegation of this.delegations.values()) {
 			if (delegation.parentSessionID !== parentSessionID) continue
 			if (delegation.notificationCycleToken !== cycleToken) continue
+			// Silent (workflow) delegations never emit terminal notifications, so
+			// counting them here would block the all-complete signal forever.
+			if (delegation.silent) continue
 
 			cycleDelegationCount += 1
 			if (!delegation.notification.terminalNotifiedAt) {
@@ -1333,6 +1343,7 @@ class DelegationManager {
 					tools: {
 						task: false,
 						delegate: false,
+						delegation_cancel: false,
 						todowrite: false,
 						plan_save: false,
 						workflow: false,
@@ -1358,6 +1369,7 @@ class DelegationManager {
 
 		await this.debugLog(`handleTimeout for delegation ${delegation.id}`)
 
+		delegation.pendingTerminalStatus = "timeout"
 		try {
 			await this.client.session.abort({
 				path: { id: delegation.sessionID },
@@ -1401,10 +1413,21 @@ class DelegationManager {
 
 		for (const delegation of this.delegations.values()) {
 			if (delegation.status !== "running") continue
+
+			// opencode does not fire tool.execute.after for tools that error, so
+			// in-flight entries can leak. Purge ancient ones so a single failed
+			// tool call cannot disarm the watchdog forever.
+			for (const [callID, startedAtMs] of delegation.activeToolCallIDs) {
+				if (now - startedAtMs > TOOL_CALL_STALE_MS) {
+					delegation.activeToolCallIDs.delete(callID)
+				}
+			}
+
 			if (delegation.activeToolCallIDs.size > 0) continue
 			if (now - delegation.lastActivityAt.getTime() <= inactivityMs) continue
 
 			await this.debugLog(`inactivity watchdog: aborting stalled delegation ${delegation.id}`)
+			delegation.pendingTerminalStatus = "timeout"
 			try {
 				await this.client.session.abort({ path: { id: delegation.sessionID } })
 			} catch {
@@ -1429,7 +1452,7 @@ class DelegationManager {
 	noteToolStart(sessionID: string, callID: string): void {
 		const delegation = this.findBySession(sessionID)
 		if (!delegation || isTerminalStatus(delegation.status)) return
-		delegation.activeToolCallIDs.add(callID)
+		delegation.activeToolCallIDs.set(callID, Date.now())
 		delegation.lastActivityAt = new Date()
 	}
 
@@ -1451,6 +1474,15 @@ class DelegationManager {
 		if (delegation.status !== "running") {
 			await this.debugLog(
 				`handleSessionIdle ignored for ${delegation.id} (status=${delegation.status})`,
+			)
+			return
+		}
+
+		// session.abort emits an idle event; when a cancel/timeout initiator is
+		// mid-finalize, do not race it into a bogus "complete".
+		if (delegation.pendingTerminalStatus) {
+			await this.debugLog(
+				`handleSessionIdle deferring to pending ${delegation.pendingTerminalStatus} for ${delegation.id}`,
 			)
 			return
 		}
@@ -1713,6 +1745,7 @@ ${description}
 
 		const wasQueued = delegation.status !== "running"
 		if (!wasQueued) {
+			delegation.pendingTerminalStatus = "cancelled"
 			try {
 				await this.client.session.abort({ path: { id: delegation.sessionID } })
 			} catch {
@@ -2421,6 +2454,21 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 		}
 	}
 
+	// Safety net: tool.execute.after does not fire for tools that error, so a
+	// failed task call could hold its tier slot until the parent goes idle.
+	// Reap anything held implausibly long.
+	const taskLeaseSweep = setInterval(() => {
+		const now = Date.now()
+		for (const [callID, lease] of taskLeases) {
+			if (now - lease.info.acquiredAt > TOOL_CALL_STALE_MS) {
+				taskLeases.delete(callID)
+				void lease.release()
+				log.warn(`released stale task lease for call ${callID}`)
+			}
+		}
+	}, 60_000)
+	taskLeaseSweep.unref?.()
+
 	await manager.debugLog("BackgroundAgentsPlugin initialized with delegation system")
 
 	return {
@@ -2434,6 +2482,7 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 
 		dispose: async () => {
 			manager.stopInactivityWatchdog()
+			clearInterval(taskLeaseSweep)
 			for (const [, lease] of taskLeases) {
 				await lease.release()
 			}

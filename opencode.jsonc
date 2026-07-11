@@ -34,6 +34,7 @@
 		"gh_grep_*": "deny",
 		"kagi_*": "deny",
 		"webfetch": "deny",
+		"websearch": "deny",
 		"worktree_*": "deny"
 	},
 	"agent": {
@@ -44,7 +45,12 @@
 			"reasoningEffort": "high",
 			"textVerbosity": "low",
 			"permission": {
-				"edit": "deny",
+				// Keep opencode's native plan-mode carve-out: plan files are the one
+				// thing the plan agent may write.
+				"edit": {
+					"*": "deny",
+					"**/.opencode/plans/*.md": "allow"
+				},
 				"write": "deny",
 				"bash": {
 					"*": "deny",
@@ -57,16 +63,19 @@
 					"wc *": "allow",
 					"grep *": "allow",
 					"rg *": "allow",
-					"find *": "allow",
 					"git status*": "allow",
 					"git log*": "allow",
 					"git diff*": "allow",
 					"git show*": "allow",
 					"git blame*": "allow",
-					"git branch*": "allow",
+					"git branch": "allow",
+					"git branch -a": "allow",
+					"git branch -v": "allow",
 					"git ls-files*": "allow"
 				},
-				"task": "allow",
+				// Native task reaches write-capable subagents only (read-only ones are
+				// routed to delegate), so plan mode denies it outright.
+				"task": "deny",
 				"delegate": "allow",
 				"workflow": "allow",
 				"workflow_status": "allow",
@@ -109,8 +118,7 @@
 				"glob": "allow",
 				"grep": "allow",
 				"bash": "allow",
-				"plan_read": "deny",
-				"todoread": "deny"
+				"plan_read": "deny"
 			}
 		},
 		"explore": {
@@ -123,7 +131,6 @@
 				"edit": "deny",
 				"write": "deny",
 				"plan_read": "deny",
-				"todoread": "deny",
 				"bash": {
 					"*": "deny",
 					"ls *": "allow",
@@ -137,13 +144,14 @@
 					"stat *": "allow",
 					"grep *": "allow",
 					"rg *": "allow",
-					"find *": "allow",
 					"git status*": "allow",
 					"git log*": "allow",
 					"git diff*": "allow",
 					"git show*": "allow",
 					"git blame*": "allow",
-					"git branch*": "allow",
+					"git branch": "allow",
+					"git branch -a": "allow",
+					"git branch -v": "allow",
 					"git ls-files*": "allow",
 					"uname*": "allow",
 					"hostname": "allow",
@@ -165,10 +173,10 @@
 				"gh_grep_*": "allow",
 				"kagi_*": "deny",
 				"webfetch": "allow",
+				"websearch": "allow",
 				"write": "deny",
 				"edit": "deny",
 				"plan_read": "deny",
-				"todoread": "deny",
 				"bash": {
 					"*": "deny",
 					"gh repo view*": "allow",
@@ -206,7 +214,6 @@
 					"sort *": "allow",
 					"uniq *": "allow",
 					"cut *": "allow",
-					"awk *": "allow",
 					"tr *": "allow"
 				}
 			}
@@ -225,8 +232,7 @@
 				"glob": "allow",
 				"read": "allow",
 				"write": "allow",
-				"plan_read": "deny",
-				"todoread": "deny"
+				"plan_read": "deny"
 			}
 		},
 		"reviewer": {
@@ -268,8 +274,7 @@
 				"glob": "allow",
 				"grep": "allow",
 				"bash": "allow",
-				"plan_read": "allow",
-				"todoread": "allow"
+				"plan_read": "allow"
 			}
 		},
 		"scout": {
@@ -284,10 +289,10 @@
 				"gh_grep_*": "allow",
 				"kagi_*": "deny",
 				"webfetch": "allow",
+				"websearch": "allow",
 				"write": "deny",
 				"edit": "deny",
 				"plan_read": "deny",
-				"todoread": "deny",
 				"bash": {
 					"*": "deny",
 					"gh repo view*": "allow",
@@ -325,7 +330,6 @@
 					"sort *": "allow",
 					"uniq *": "allow",
 					"cut *": "allow",
-					"awk *": "allow",
 					"tr *": "allow"
 				}
 			}
@@ -370,9 +374,6 @@
 			"enabled": true
 		}
 	},
-	"instructions": [
-		"./tools/philosophy.md"
-	],
 	"plugin": [
 		"@tarquinen/opencode-dcp@3.1.3",
 		"@franlol/opencode-md-table-formatter@0.0.6"

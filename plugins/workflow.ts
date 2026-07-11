@@ -238,6 +238,13 @@ The call blocks until the script finishes and returns its result. Subagent concu
 				sessionID: toolCtx.sessionID,
 			}
 			runRegistry.set(runId, state)
+			// Keep the in-memory registry bounded; journals are the durable record.
+			if (runRegistry.size > 20) {
+				for (const [oldRunId, oldState] of runRegistry) {
+					if (runRegistry.size <= 20) break
+					if (oldState.status !== "running") runRegistry.delete(oldRunId)
+				}
+			}
 
 			const result = await runWorkflowScript({
 				script,
@@ -249,6 +256,9 @@ The call blocks until the script finishes and returns its result. Subagent concu
 				handle,
 				journal,
 				client,
+				// Plan mode stays read-only: workflow agents spawned from the plan
+				// agent must pass the delegation manager's read-only guard.
+				enforceReadOnly: toolCtx.agent === "plan",
 				updateMetadata: (progress) => {
 					state.phase = progress.phase
 					state.lastLog = progress.lastLog

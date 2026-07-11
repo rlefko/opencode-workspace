@@ -83,6 +83,12 @@ for dir in "${MANAGED_DIRS[@]}"; do
 		ln -sfn "${REPO}/${dir}" "${TARGET}/${dir}"
 		echo "linked   ${dir}/"
 	else
+		# A leftover symlink (from --link against another clone) must be removed
+		# first: rsync would otherwise write THROUGH it and --delete would wipe
+		# the directory it points at.
+		if [[ -L "${TARGET}/${dir}" ]]; then
+			rm "${TARGET}/${dir}"
+		fi
 		# Managed dirs are fully repo-owned; --delete is safe because the prior
 		# state was just backed up. Test files stay in the repo.
 		rsync -a --delete --exclude "*.test.ts" "${REPO}/${dir}/" "${TARGET}/${dir}/"
@@ -102,6 +108,9 @@ for file in "${MANAGED_FILES[@]}"; do
 		ln -sfn "${REPO}/${file}" "${TARGET}/${file}"
 		echo "linked   ${file}"
 	else
+		if [[ -L "${TARGET}/${file}" ]]; then
+			rm "${TARGET}/${file}"
+		fi
 		install -m 644 "${REPO}/${file}" "${TARGET}/${file}"
 		echo "synced   ${file}"
 	fi

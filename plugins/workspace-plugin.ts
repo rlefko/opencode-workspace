@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
+import type { Event } from "@opencode-ai/sdk"
 import { z } from "zod"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 
@@ -294,7 +295,7 @@ interface SystemTransformInput {
 // ==========================================
 
 /** Tracks in-flight coder task callIDs with timestamps for stale cleanup */
-const activeCoderCalls = new Map<string, { startTime: number }>()
+const activeCoderCalls = new Map<string, { startTime: number; sessionID?: string }>()
 
 /**
  * Stale call timeout for reminder bookkeeping only (nothing is killed here).
@@ -574,14 +575,41 @@ Today is ${today}. When searching for documentation, APIs, or external resources
 
 		// Track coder task starts for review trigger
 		"tool.execute.before": async (
-			input: { tool: string; callID?: string },
+			input: { tool: string; sessionID?: string; callID?: string },
 			output: { args?: { subagent_type?: string } },
 		) => {
 			if (input.tool !== "task") return
 			if (!input.callID) return
 			if (output.args?.subagent_type !== "coder") return
 
-			activeCoderCalls.set(input.callID, { startTime: Date.now() })
+			activeCoderCalls.set(input.callID, {
+				startTime: Date.now(),
+				sessionID: input.sessionID,
+			})
+		},
+
+		// Clear tracked coder calls whose parent went idle without a matching
+		// tool.execute.after (aborted turns, tool errors); otherwise the review
+		// reminder never fires again for that session.
+		event: async ({ event }: { event: Event }) => {
+			let idleSessionID: string | undefined
+			if (event.type === "session.idle") {
+				idleSessionID = event.properties.sessionID
+			} else if (event.type === "session.status") {
+				const properties = event.properties as {
+					sessionID?: string
+					status?: { type?: string }
+				}
+				if (properties.status?.type === "idle") {
+					idleSessionID = properties.sessionID
+				}
+			}
+			if (!idleSessionID) return
+			for (const [callID, data] of activeCoderCalls) {
+				if (data.sessionID === idleSessionID) {
+					activeCoderCalls.delete(callID)
+				}
+			}
 		},
 
 		// Trigger review reminder when plan_save or all coder tasks complete
@@ -589,8 +617,10 @@ Today is ${today}. When searching for documentation, APIs, or external resources
 			input: { tool: string; sessionID: string; callID: string },
 			output: { title: string; output: string; metadata: unknown },
 		) => {
-			// Plan save triggers reviewer delegation reminder
+			// Plan save triggers reviewer delegation reminder (only on success:
+			// validation failures return a ❌ string and save nothing)
 			if (input.tool === "plan_save") {
+				if (output.output.trimStart().startsWith("❌")) return
 				output.output += `\n\n<system-reminder>
 Plan saved successfully. You MUST now delegate to the reviewer:
 1. Use the \`delegate\` tool to send the plan to the \`reviewer\` agent
@@ -653,7 +683,7 @@ ${planContent}
 ${currentTask ? `Current task: ${currentTask}` : "No task marked as CURRENT"}
 
 ## Verification
-To verify any cited decision, use \`delegation_read("ref:id")\`.
+To verify a decision cited as \`ref:some-id\`, call \`delegation_read("some-id")\` (the ref: prefix is optional).
 </workspace-context>`)
 		},
 	}

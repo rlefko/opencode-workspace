@@ -72,9 +72,17 @@ describe("model and tool mapping", () => {
 			write: "deny",
 			bash: { "*": "deny" },
 			webfetch: "deny",
+			websearch: "deny",
 			read: "allow",
 			grep: "allow",
 		})
+	})
+
+	test("Write implies the edit permission and WebSearch maps to websearch", () => {
+		const permission = mapClaudeTools("Write, WebSearch")
+		expect(permission?.write).toBe("allow")
+		expect(permission?.edit).toBe("allow")
+		expect(permission?.websearch).toBe("allow")
 	})
 
 	test("no tools list means inherit", () => {

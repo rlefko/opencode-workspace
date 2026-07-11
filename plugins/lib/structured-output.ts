@@ -33,8 +33,10 @@ export function extractJson(text: string): ExtractResult {
 	const fencedAny = text.match(/```[a-zA-Z]*\s*\n?([\s\S]*?)```/)
 	if (fencedAny?.[1]) candidates.push(fencedAny[1].trim())
 
-	const balanced = scanBalancedJson(text)
-	if (balanced) candidates.push(balanced)
+	// Objects before arrays: prose like "findings [1] show {...}" contains a
+	// balanced "[1]" that would otherwise win over the real payload.
+	candidates.push(...scanBalancedCandidates(text, "{"))
+	candidates.push(...scanBalancedCandidates(text, "["))
 
 	const trimmed = text.trim()
 	if (trimmed.startsWith("{") || trimmed.startsWith("[")) candidates.push(trimmed)
@@ -57,11 +59,14 @@ export function extractJson(text: string): ExtractResult {
 	}
 }
 
-function scanBalancedJson(text: string): string | null {
-	for (let start = 0; start < text.length; start++) {
-		const open = text[start]
-		if (open !== "{" && open !== "[") continue
-		const close = open === "{" ? "}" : "]"
+const MAX_BALANCED_CANDIDATES = 8
+
+function scanBalancedCandidates(text: string, open: "{" | "["): string[] {
+	const close = open === "{" ? "}" : "]"
+	const found: string[] = []
+
+	for (let start = 0; start < text.length && found.length < MAX_BALANCED_CANDIDATES; start++) {
+		if (text[start] !== open) continue
 
 		let depth = 0
 		let inString = false
@@ -85,13 +90,15 @@ function scanBalancedJson(text: string): string | null {
 			else if (ch === close) {
 				depth--
 				if (depth === 0) {
-					return text.slice(start, i + 1)
+					found.push(text.slice(start, i + 1))
+					// Skip past this candidate; nested opens inside it were part of it.
+					start = i
+					break
 				}
 			}
 		}
-		// Unbalanced from this start; try the next opening character.
 	}
-	return null
+	return found
 }
 
 export type ValidationResult = { ok: true } | { ok: false; errors: string[] }

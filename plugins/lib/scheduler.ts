@@ -88,6 +88,7 @@ interface Waiter {
 	resolve(lease: Lease): void
 	reject(error: Error): void
 	settled: boolean
+	attemptInFlight?: boolean
 	waitTimer?: ReturnType<typeof setTimeout>
 	pollTimer?: ReturnType<typeof setTimeout>
 	abortListener?: () => void
@@ -119,8 +120,9 @@ export class TierScheduler {
 	private readonly inMemoryCounts = new Map<string, number>()
 	private heartbeatTimer?: ReturnType<typeof setInterval>
 	private exitHookInstalled = false
-	private initialized = false
+	private initPromise?: Promise<void>
 	private disposed = false
+	private inMemorySlotCounter = 0
 
 	constructor(cfg: HarnessConfig, log: SchedulerLogger = NOOP_LOGGER) {
 		this.cfg = cfg
@@ -132,11 +134,17 @@ export class TierScheduler {
 		}
 	}
 
-	async init(): Promise<void> {
-		if (this.initialized) return
-		this.initialized = true
-		if (!this.cfg.scheduler.crossProcess) return
+	init(): Promise<void> {
+		if (!this.initPromise) {
+			this.initPromise = this.doInit().catch((error) => {
+				this.log.warn(`scheduler: init failed: ${String(error)}`)
+			})
+		}
+		return this.initPromise
+	}
 
+	private async doInit(): Promise<void> {
+		if (!this.cfg.scheduler.crossProcess) return
 		for (const tier of this.tiersByName.values()) {
 			const tierDir = this.tierDir(tier.name)
 			await fs.mkdir(tierDir, { recursive: true })
@@ -165,12 +173,17 @@ export class TierScheduler {
 			throw new AcquireAbortedError(tierName)
 		}
 
-		const immediate = await this.tryAcquireSlot(tier, opts)
-		if (opts.signal?.aborted) {
-			if (immediate) await immediate.release()
-			throw new AcquireAbortedError(tierName)
+		// No fast path while waiters exist: newcomers must not barge ahead of the
+		// FIFO queue when a slot happens to be free at call time.
+		const existingQueue = this.queues.get(tierName)
+		if (!existingQueue || existingQueue.length === 0) {
+			const immediate = await this.tryAcquireSlot(tier, opts)
+			if (opts.signal?.aborted) {
+				if (immediate) await immediate.release()
+				throw new AcquireAbortedError(tierName)
+			}
+			if (immediate) return immediate
 		}
-		if (immediate) return immediate
 
 		return await new Promise<Lease>((resolve, reject) => {
 			const queue = this.queues.get(tierName)
@@ -289,7 +302,9 @@ export class TierScheduler {
 			const count = this.inMemoryCounts.get(tier.name) ?? 0
 			if (count >= tier.maxConcurrent) return null
 			this.inMemoryCounts.set(tier.name, count + 1)
-			const lease = this.buildHeldLease(tier, count, opts, undefined)
+			// Monotonic slot ids: reusing the current count as the id collides in
+			// the held map after release-then-acquire churn.
+			const lease = this.buildHeldLease(tier, ++this.inMemorySlotCounter, opts, undefined)
 			return this.toLease(lease)
 		}
 
@@ -313,8 +328,15 @@ export class TierScheduler {
 				const lease = this.buildHeldLease(tier, slot, opts, filePath)
 				try {
 					await handle.writeFile(JSON.stringify(lease.info, null, "\t"), "utf8")
-				} finally {
 					await handle.close()
+				} catch (writeError) {
+					// A half-written slot file with a registered held entry would leak
+					// capacity; clean both up and treat the slot as unavailable.
+					await handle.close().catch(() => {})
+					this.held.delete(this.heldKey(tier.name, slot))
+					await fs.unlink(filePath).catch(() => {})
+					this.log.warn(`scheduler: slot write failed for ${filePath}: ${String(writeError)}`)
+					return null
 				}
 				this.startHeartbeat()
 				return this.toLease(lease)
@@ -470,7 +492,17 @@ export class TierScheduler {
 			const count = this.inMemoryCounts.get(lease.info.tier) ?? 0
 			this.inMemoryCounts.set(lease.info.tier, Math.max(0, count - 1))
 		} else if (lease.filePath && !lease.lost) {
-			await fs.unlink(lease.filePath).catch(() => {})
+			// Verify ownership before unlinking: if we were reaped (e.g. after a
+			// sleep) another process may have re-acquired this slot path, and
+			// deleting its live lease would silently break the tier cap.
+			try {
+				const current = JSON.parse(await fs.readFile(lease.filePath, "utf8")) as LeaseInfo
+				if (current.pid === process.pid && current.acquiredAt === lease.info.acquiredAt) {
+					await fs.unlink(lease.filePath).catch(() => {})
+				}
+			} catch {
+				// File already gone or unreadable; nothing to release on disk.
+			}
 		}
 
 		if (this.held.size === 0 && this.heartbeatTimer) {
@@ -510,11 +542,31 @@ export class TierScheduler {
 				continue
 			}
 
+			// If our own on-disk heartbeat is already stale (we slept past staleMs),
+			// another process may reap and re-acquire this slot at any moment.
+			// Renaming over it could clobber their fresh lease; surrender instead.
+			if (Date.now() - current.heartbeatAt > this.cfg.scheduler.staleMs) {
+				lease.lost = true
+				this.log.warn(
+					`scheduler: lease ${lease.info.tier}/slot-${lease.info.slot} went stale (slept?); surrendering it`,
+				)
+				continue
+			}
+
 			lease.info.heartbeatAt = Date.now()
 			const tmpPath = `${lease.filePath}.tmp-${process.pid}`
 			try {
 				await fs.writeFile(tmpPath, JSON.stringify(lease.info, null, "\t"), "utf8")
+				if (lease.released) {
+					// Released while we were writing; do not resurrect the slot file.
+					await fs.unlink(tmpPath).catch(() => {})
+					continue
+				}
 				await fs.rename(tmpPath, lease.filePath)
+				if (lease.released) {
+					// Release raced the rename; remove the file we just recreated.
+					await fs.unlink(lease.filePath).catch(() => {})
+				}
 			} catch (error) {
 				await fs.unlink(tmpPath).catch(() => {})
 				this.log.warn(`scheduler: heartbeat failed for ${lease.filePath}: ${String(error)}`)
@@ -565,24 +617,36 @@ export class TierScheduler {
 		const queue = this.queues.get(tier.name)
 		if (!queue || queue.length === 0) return
 		const head = queue[0]
-		if (head.settled || head.pollTimer) return
+		if (head.settled || head.attemptInFlight) return
+
+		// A release should hand the slot to the head immediately, not after the
+		// current poll interval elapses: cancel any scheduled poll and try now.
+		if (head.pollTimer) {
+			clearTimeout(head.pollTimer)
+			head.pollTimer = undefined
+		}
 
 		const attempt = async () => {
 			head.pollTimer = undefined
-			if (head.settled) return
-			const lease = await this.tryAcquireSlot(tier, head.opts).catch(() => null)
-			if (head.settled) {
-				if (lease) void lease.release()
-				return
+			if (head.settled || head.attemptInFlight) return
+			head.attemptInFlight = true
+			try {
+				const lease = await this.tryAcquireSlot(tier, head.opts).catch(() => null)
+				if (head.settled) {
+					if (lease) void lease.release()
+					return
+				}
+				if (lease) {
+					head.resolve(lease)
+					return
+				}
+				// Jittered retry keeps multiple waiting processes from polling in lockstep.
+				const jitter = 0.8 + Math.random() * 0.4
+				head.pollTimer = setTimeout(() => void attempt(), this.cfg.scheduler.pollMs * jitter)
+				head.pollTimer.unref?.()
+			} finally {
+				head.attemptInFlight = false
 			}
-			if (lease) {
-				head.resolve(lease)
-				return
-			}
-			// Jittered retry keeps multiple waiting processes from polling in lockstep.
-			const jitter = 0.8 + Math.random() * 0.4
-			head.pollTimer = setTimeout(() => void attempt(), this.cfg.scheduler.pollMs * jitter)
-			head.pollTimer.unref?.()
 		}
 
 		head.pollTimer = setTimeout(() => void attempt(), 0)

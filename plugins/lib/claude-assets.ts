@@ -106,6 +106,7 @@ export function mapClaudeTools(
 		write: "deny",
 		bash: { "*": "deny" },
 		webfetch: "deny",
+		websearch: "deny",
 	}
 
 	for (const rawName of tools.split(",")) {
@@ -126,7 +127,10 @@ export function mapClaudeTools(
 				permission.edit = "allow"
 				break
 			case "write":
+				// opencode's write tool requests the "edit" permission; keep the
+				// "write" key too for read-only capability detection.
 				permission.write = "allow"
+				permission.edit = "allow"
 				break
 			case "bash":
 				permission.bash = "allow"
@@ -134,9 +138,12 @@ export function mapClaudeTools(
 			case "webfetch":
 				permission.webfetch = "allow"
 				break
+			case "websearch":
+				permission.websearch = "allow"
+				break
 			default:
-				// WebSearch, Task, TodoWrite, Skill and unknown names have no direct
-				// opencode equivalent at the permission layer; ignored by design.
+				// Task, TodoWrite, Skill and unknown names have no direct opencode
+				// equivalent at the permission layer; ignored by design.
 				break
 		}
 	}
@@ -376,6 +383,18 @@ export async function applyClaudeCompat(
 	log: CompatLogger,
 ): Promise<CompatReport> {
 	const report: CompatReport = { instructions: [], agents: [], commands: [], skipped: [] }
+
+	// opencode resolves relative `instructions` entries against the project,
+	// not the config dir, so the harness philosophy file must be injected with
+	// an absolute path to load at all.
+	const philosophyPath = path.join(os.homedir(), ".opencode", "tools", "philosophy.md")
+	if (await fileExists(philosophyPath)) {
+		const existing = new Set((config.instructions ?? []).map((entry) => path.resolve(entry)))
+		if (!existing.has(philosophyPath)) {
+			config.instructions = [...(config.instructions ?? []), philosophyPath]
+			report.instructions.push(philosophyPath)
+		}
+	}
 
 	const instructions = await collectClaudeInstructions(
 		worktree,

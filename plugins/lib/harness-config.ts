@@ -164,6 +164,12 @@ export async function loadHarnessConfig(projectDir: string): Promise<HarnessConf
 			`scheduler.staleMs (${config.scheduler.staleMs}) should be well above heartbeatMs (${config.scheduler.heartbeatMs}); healthy leases may be reaped`,
 		)
 	}
+	if (config.defaultTier !== null && !config.tiers.some((tier) => tier.name === config.defaultTier)) {
+		warnings.push(
+			`defaultTier "${config.defaultTier}" names no configured tier; treating it as null (uncapped)`,
+		)
+		config.defaultTier = null
+	}
 	config.scheduler.leaseDir = expandHomePath(config.scheduler.leaseDir)
 	return { config, sources, warnings }
 }

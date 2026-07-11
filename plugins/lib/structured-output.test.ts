@@ -33,6 +33,12 @@ describe("extractJson", () => {
 		if (result.ok) expect(result.value).toEqual({ ok: true })
 	})
 
+	test("prefers a real object over an earlier citation bracket", () => {
+		const result = extractJson('Based on my findings [1], here it is: {"angles": [{"title": "t"}]}')
+		expect(result.ok).toBe(true)
+		if (result.ok) expect(result.value).toEqual({ angles: [{ title: "t" }] })
+	})
+
 	test("reports failure on garbage", () => {
 		const result = extractJson("no json here at all")
 		expect(result.ok).toBe(false)
