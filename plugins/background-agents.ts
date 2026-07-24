@@ -17,6 +17,7 @@ import type { Event, Message, Part, ReasoningPart, TextPart } from "@opencode-ai
 import { adjectives, animals, colors, uniqueNamesGenerator } from "unique-names-generator"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 import type { OpencodeClient } from "./kdco-primitives/types"
+import { rememberSessionAgent, resolveSessionAgent } from "./lib/agent-tracker"
 import {
 	type DelegationOutcome,
 	registerDelegationHandle,
@@ -2584,16 +2585,21 @@ const BackgroundAgentsPlugin: Plugin = async (ctx) => {
 			}
 		},
 
-		// Inject delegation rules into system prompt
-		"experimental.chat.system.transform": async (_input: SystemTransformInput, output) => {
+		// Inject delegation rules into system prompt. Subagents cannot delegate
+		// (their task/delegate tools are disabled), so only orchestrators get the
+		// rules; unresolved agents fail open to preserve prior behavior.
+		"experimental.chat.system.transform": async (input: SystemTransformInput, output) => {
+			const agent = resolveSessionAgent(input)
+			if (agent && agent !== "plan" && agent !== "build") return
 			output.system.push(DELEGATION_RULES)
 		},
 
 		// Deliver queued parent notifications on the next user turn if direct delivery failed.
 		"chat.message": async (
-			input: { sessionID?: string },
+			input: { sessionID?: string; agent?: string },
 			output: { parts?: Array<{ type: string; text?: string }> },
 		) => {
+			rememberSessionAgent(input.sessionID, input.agent)
 			if (!input.sessionID) return
 			manager.injectPendingNotificationsIntoChatMessage(output, input.sessionID)
 		},

@@ -3,6 +3,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
+import { rememberSessionAgent, resolveSessionAgent } from "./lib/agent-tracker"
 import { z } from "zod"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 
@@ -330,12 +331,15 @@ change code, run write commands, or commit. Your deliverable is understanding
 plus a plan the build agent can execute.
 
 ### How to work
-1. **Explore directly.** Read files, grep, glob, and inspect git yourself for
-   targeted questions. This is normal and expected.
-2. **Delegate broad sweeps.** For wide codebase reconnaissance use
-   \`delegate\` to \`explore\`; for external docs/APIs/packages use \`researcher\`.
-   Fan out several delegations in parallel when areas are independent; for a
-   coordinated multi-agent sweep use the \`workflow\` tool.
+1. **Fan out FIRST.** For any non-trivial request, your FIRST action is to
+   launch background reconnaissance in parallel: \`delegate\` one or more
+   \`explore\` sweeps over the relevant areas, and \`researcher\` for external
+   docs/APIs/packages. Do this BEFORE reading files yourself. One delegation
+   per independent area or question.
+2. **Explore directly while they run.** Read files, grep, glob, and inspect
+   git yourself for targeted questions; delegation results arrive as
+   notifications while you work. For a coordinated multi-agent sweep use the
+   \`workflow\` tool.
 3. **Ask when it matters.** If requirements are ambiguous, ask the user
    focused questions before locking the plan. Do not guess intent.
 4. **Honor project instructions.** Read CLAUDE.md / AGENTS.md for project
@@ -424,10 +428,15 @@ context, exactly like a lead engineer using teammates.
    \`delegation_list\` ONCE for prior research; reuse its findings.
 3. **Implement directly.** Small and medium edits are YOUR job. Do not
    delegate what you can do in a few tool calls.
-4. **Delegate for scale.** Use \`task\` with \`coder\` for a big independent
-   implementation chunk; \`delegate\` to \`explore\`/\`researcher\` for
-   background reconnaissance; the \`workflow\` tool for coordinated
-   multi-agent fan-outs (parallel reviews, per-file pipelines, deep research).
+4. **Delegate for scale, proactively.** Concrete triggers:
+   - Touching an UNFAMILIAR area? \`delegate\` an \`explore\` sweep first and
+     keep working while it runs.
+   - Two or more independent questions or investigations? Fan them out in
+     parallel (\`explore\` for the codebase, \`researcher\` for the web,
+     \`general\` for multi-step side quests).
+   - Big independent implementation chunk? \`task\` with \`coder\`.
+   - Coordinated multi-agent job (parallel reviews, per-file pipelines, deep
+     research)? The \`workflow\` tool.
 5. **Verify your work.** Run the project's build/lint/tests after changes.
    Do not claim success without evidence.
 6. **Load philosophy skills before significant code:** frontend work →
@@ -555,9 +564,15 @@ const WorkspacePlugin: Plugin = async (ctx) => {
 			}),
 		},
 
+		// Record the session's agent: on opencode 1.17.x the system transform
+		// input never carries it, so chat.message is the source of truth.
+		"chat.message": async (input: { sessionID?: string; agent?: string }) => {
+			rememberSessionAgent(input.sessionID, input.agent)
+		},
+
 		// Targeted Rule Injection
 		"experimental.chat.system.transform": async (input: SystemTransformInput, output) => {
-			const agent = input.agent
+			const agent = resolveSessionAgent(input)
 
 			// Universal date awareness (all agents) - Law 2: Parse intent, not just data
 			const today = new Date().toISOString().split("T")[0]

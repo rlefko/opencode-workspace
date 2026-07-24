@@ -12,6 +12,7 @@ import * as path from "node:path"
 import { type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
 import { getProjectId } from "./kdco-primitives/get-project-id"
 import type { OpencodeClient } from "./kdco-primitives/types"
+import { rememberSessionAgent, resolveSessionAgent } from "./lib/agent-tracker"
 import { getDelegationHandle } from "./lib/delegation-registry"
 import { runWorkflowScript, WORKFLOW_LIMITS } from "./lib/workflow-runtime"
 import { WorkflowJournal } from "./lib/workflow-journal"
@@ -365,8 +366,13 @@ Read a run's journal.jsonl for full detail.`,
 			workflow_status: workflowStatusTool,
 		},
 
+		"chat.message": async (input: { sessionID?: string; agent?: string }) => {
+			rememberSessionAgent(input.sessionID, input.agent)
+		},
+
 		"experimental.chat.system.transform": async (input: SystemTransformInput, output) => {
-			if (input.agent === "plan" || input.agent === "build") {
+			const agent = resolveSessionAgent(input)
+			if (agent === "plan" || agent === "build") {
 				output.system.push(WORKFLOW_RULES)
 			}
 		},
