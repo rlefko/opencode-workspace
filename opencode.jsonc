@@ -345,6 +345,10 @@
 				}
 			}
 		},
+		// Native hidden agent used for session summaries; pin it to the top model.
+		"summary": {
+			"model": "lmstudio/qwen/qwen3.6-27b"
+		},
 		"title": {
 			"mode": "primary",
 			"model": "lmstudio/qwen/qwen3.6-35b-a3b",

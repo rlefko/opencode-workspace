@@ -375,6 +375,55 @@ export async function collectClaudeCommands(
 }
 
 /**
+ * Lint skills for opencode's silent-rejection rules: the SKILL.md frontmatter
+ * name must exist and exactly match its directory name, and a description is
+ * required for the skill to be advertised. Discovery itself is native; this
+ * only surfaces why a skill might be invisible.
+ */
+export async function lintSkills(
+	worktree: string,
+	report: CompatReport,
+	log: CompatLogger,
+): Promise<void> {
+	const skillRoots = [
+		path.join(worktree, ".claude", "skills"),
+		path.join(os.homedir(), ".claude", "skills"),
+	]
+	for (const root of skillRoots) {
+		let entries: string[]
+		try {
+			entries = await fs.readdir(root)
+		} catch {
+			continue
+		}
+		for (const dirName of entries) {
+			const skillPath = path.join(root, dirName, "SKILL.md")
+			let content: string
+			try {
+				content = await fs.readFile(skillPath, "utf8")
+			} catch {
+				continue
+			}
+			const { data } = parseFrontmatter(content)
+			if (!data.name) {
+				report.skipped.push(`${skillPath} (missing frontmatter name; opencode will reject it)`)
+				log.warn(`claude-compat: skill ${skillPath} has no frontmatter name and will be ignored`)
+			} else if (data.name !== dirName) {
+				report.skipped.push(
+					`${skillPath} (frontmatter name "${data.name}" != directory "${dirName}"; opencode will reject it)`,
+				)
+				log.warn(
+					`claude-compat: skill ${skillPath} name "${data.name}" does not match its directory "${dirName}" and will be ignored by opencode`,
+				)
+			} else if (!data.description) {
+				report.skipped.push(`${skillPath} (missing description; skill will not be advertised)`)
+				log.warn(`claude-compat: skill ${skillPath} has no description and will not be advertised`)
+			}
+		}
+	}
+}
+
+/**
  * Apply everything to the mutable config. Returns the report for logging.
  */
 export async function applyClaudeCompat(
@@ -419,6 +468,8 @@ export async function applyClaudeCompat(
 			report.agents.push(name)
 		}
 	}
+
+	await lintSkills(worktree, report, log)
 
 	const commands = await collectClaudeCommands(worktree, report, log)
 	if (commands.size > 0) {
